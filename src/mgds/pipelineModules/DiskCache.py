@@ -223,6 +223,7 @@ class DiskCache(
 
                 # Initialize Persistent Cache State with the current run's set of files
                 cache_stable = self.persistent_key_in_name is not None
+                persistent_key_metadata = None
                 if cache_stable:
                     # Map each `group_index` to a persistent key--a value that will always be the
                     # same for the file (or the file's data in a perfect world), so that our
@@ -231,6 +232,16 @@ class DiskCache(
                                                                                  self.persistent_key_in_name,
                                                                                  in_index)
                                             for group_index, in_index in enumerate(self.group_indices[group_key])}
+
+                    # Compute file metadata (mtime + size) for content change detection
+                    persistent_key_metadata = {}
+                    for persistent_key in group_index_mappings.values():
+                        if persistent_key not in persistent_key_metadata:
+                            try:
+                                stat = os.stat(persistent_key)
+                                persistent_key_metadata[persistent_key] = f"{stat.st_mtime_ns}:{stat.st_size}"
+                            except OSError:
+                                persistent_key_metadata[persistent_key] = ""
                 else:
                     # As we don't have a persistent key to map each group_index to the file that it
                     # represents, we fall-back to the legacy unstable behavior by mapping each
@@ -243,6 +254,7 @@ class DiskCache(
                                             for group_index in range(len(self.group_indices[group_key]))}
 
                 persistent_cache.build_cache_file_mappings(group_index_mappings,
+                                                           persistent_key_metadata=persistent_key_metadata,
                                                            remove_stale_cache=False)
 
                 # Resave our cache state if we are using stable file mappings

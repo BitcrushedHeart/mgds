@@ -131,6 +131,14 @@ class PersistentCacheState:
     retrieve this class's data.
     """
 
+    _persistent_key_metadata_map: dict[str, str]
+    """
+    Dictionary mapping each known `persistent_key` to an optional metadata string (e.g.,
+    "mtime_ns:size"). Used to detect when a cached file's source data has changed on disk.
+    When the stored metadata for a key differs from the current metadata, the cached data for
+    that key is invalidated and will be regenerated.
+    """
+
     _transient_group_index_to_persistent_index_map: dict[int, int]
     """
     Transient (not saved) mapping of the current group's `group_index` indices to their corresponding
@@ -204,6 +212,7 @@ class PersistentCacheState:
             cache_uuid = uuid4()
 
         self._persistent_key_to_persistent_index_map = dict()
+        self._persistent_key_metadata_map = dict()
         self._transient_group_index_to_persistent_index_map = dict()
         self._transient_persistent_index_to_group_index_map = dict()
         self.reset(persistent_index_starting_value,
@@ -234,6 +243,7 @@ class PersistentCacheState:
                 persistent_key: str(persistent_index)
                 for persistent_key, persistent_index in self._persistent_key_to_persistent_index_map.items()
             },
+            'persistent_key_metadata': dict(self._persistent_key_metadata_map),
         }
 
         return data
@@ -415,6 +425,16 @@ class PersistentCacheState:
                                  f' the current maximum value "{next_persistent_index - 1}.')
 
 
+        ## persistent_key_metadata (optional, not present in V1 caches) ##
+        persistent_key_metadata = cache_state_data.get('persistent_key_metadata', {})
+        if not isinstance(persistent_key_metadata, dict):
+            persistent_key_metadata = {}
+        # Filter to only include metadata for keys that exist in the key map
+        persistent_key_metadata = {
+            k: v for k, v in persistent_key_metadata.items()
+            if isinstance(k, str) and isinstance(v, str) and k in persistent_key_map
+        }
+
         # We have validated everything now, build and return our object
         persistent_cache_state = PersistentCacheState(cache_dir=cache_dir,
                                                       aggregate_filename=aggregate_file_path,
@@ -423,29 +443,38 @@ class PersistentCacheState:
                                                       persistent_index_starting_value=next_persistent_index,
                                                       cache_uuid=cache_uuid)
         persistent_cache_state._persistent_key_to_persistent_index_map = persistent_key_map
+        persistent_cache_state._persistent_key_metadata_map = persistent_key_metadata
 
         return persistent_cache_state
 
     def build_cache_file_mappings(self,
                                   group_index_to_persistent_key_map: dict[int, str],
+                                  persistent_key_metadata: dict[str, str] | None = None,
                                   remove_stale_cache: bool = False):
         """
         Sets and creates the mapping between our local run's `group_index` values to the persistent
         cache's `persistent_index` value using the provided `group_index_to_persistent_key_map`.
-        
+
         NOTE: It is important to include all `group_index` values for this group in this call, as
         all previously-known values, that are now no longer present, will be removed from our lists,
         split files deleted, and need re-caching.
-        
+
         :param group_index_to_persistent_key_map: Mapping of all currently valid `group_index` values
             to their `persistent_key` values. Values no longer present will be assumed to be invalid,
             and will have their data deleted and discarded.
         :type group_index_to_persistent_key_map: dict[int, str]
-        
+
+        :param persistent_key_metadata: Optional mapping of `persistent_key` values to metadata
+            strings (e.g., "mtime_ns:file_size"). When provided, cached entries whose stored metadata
+            differs from the current metadata will have their split files deleted, forcing re-caching.
+            Keys with no previously stored metadata are not invalidated (metadata is just stored for
+            future comparisons).
+        :type persistent_key_metadata: dict[str, str] | None
+
         :param remove_stale_cache: If True, cache split items we are aware of, that no longer exist
             in the current `group_index` list will be removed from disk. The corresponding aggregate
             cache item will also be removed.
-            
+
             If False, we do not delete files that are no longer in our current `group_index` list. If
             these files are re-added at a future point, the existing cache items will be used.
         :type remove_stale_cache: bool
@@ -453,6 +482,26 @@ class PersistentCacheState:
 
         self._transient_group_index_to_persistent_index_map.clear()
         self._transient_persistent_index_to_group_index_map.clear()
+
+        # Invalidate cached entries whose source file metadata has changed
+        stale_persistent_keys = []
+        if persistent_key_metadata is not None:
+            for persistent_key, current_metadata in persistent_key_metadata.items():
+                if persistent_key not in self._persistent_key_to_persistent_index_map:
+                    continue
+                stored_metadata = self._persistent_key_metadata_map.get(persistent_key)
+                if stored_metadata is not None and stored_metadata != current_metadata:
+                    stale_persistent_keys.append(persistent_key)
+
+            # Delete split files for stale keys and remove them from the key map
+            # so they get assigned fresh persistent_index values and re-cached
+            for stale_key in stale_persistent_keys:
+                stale_index = self._persistent_key_to_persistent_index_map[stale_key]
+                stale_file = self._get_split_item_file_path_by_persistent_index(stale_index)
+                if stale_file is not None and stale_file.is_file():
+                    stale_file.unlink(missing_ok=True)
+                del self._persistent_key_to_persistent_index_map[stale_key]
+                self._persistent_key_metadata_map.pop(stale_key, None)
 
         # Now that we have a list of valid persistent keys, make a list of items that are no longer
         # current so that we can remove the stale items from our cache.
@@ -483,7 +532,11 @@ class PersistentCacheState:
             self._transient_group_index_to_persistent_index_map[group_index] = persistent_index
             self._transient_persistent_index_to_group_index_map[persistent_index] = group_index
 
-        # Ensure we have mappings for all of the input data, and that 
+        # Update stored metadata with current values
+        if persistent_key_metadata is not None:
+            self._persistent_key_metadata_map.update(persistent_key_metadata)
+
+        # Ensure we have mappings for all of the input data, and that
         assert len(self._transient_group_index_to_persistent_index_map) == len(group_index_to_persistent_key_map)
 
         if remove_stale_cache:
@@ -498,6 +551,7 @@ class PersistentCacheState:
                     inactive_cache_file.unlink(missing_ok=True)
 
                 del self._persistent_key_to_persistent_index_map[inactive_persistent_key]
+                self._persistent_key_metadata_map.pop(inactive_persistent_key, None)
 
     def get_aggregate_cache(self,
                             torch_device: torch.device | str | dict[str, str] | None,
@@ -925,6 +979,7 @@ class PersistentCacheState:
             self._cache_uuid = cache_uuid
 
         self._persistent_key_to_persistent_index_map.clear()
+        self._persistent_key_metadata_map.clear()
         self._transient_group_index_to_persistent_index_map.clear()
         self._transient_persistent_index_to_group_index_map.clear()
 
