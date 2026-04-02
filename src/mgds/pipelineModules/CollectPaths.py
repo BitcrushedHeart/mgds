@@ -43,6 +43,8 @@ class CollectPaths(
         return [self.path_out_name, self.concept_out_name]
 
     def __list_files(self, path: str, include_subdirectories: bool) -> list[str]:
+        if not os.path.isdir(path):
+            return []
         dir_list = [os.path.join(path, filename) for filename in os.listdir(path)]
 
         files = list(filter(os.path.isfile, dir_list))
