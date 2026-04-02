@@ -389,8 +389,9 @@ class PersistentCacheState:
             try:
                 cache_uuid = UUID(hex=cache_state_data['cache_uuid'])
             except ValueError as ex:
+                uuid_val = cache_state_data['cache_uuid']
                 print(f'Invalid disk cache state, `cache_uuid` invalid (could not  convert "'
-                      f'{cache_state_data['cache_uuid']}" into hex UUID: {str(ex)}).')
+                      f'{uuid_val}" into hex UUID: {str(ex)}).')
                 raise ex
 
 
