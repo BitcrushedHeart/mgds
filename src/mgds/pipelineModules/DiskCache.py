@@ -10,6 +10,7 @@ import torch
 from tqdm import tqdm
 
 from mgds.PipelineModule import PipelineModule
+from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
 from mgds.pipelineModuleTypes.SingleVariationRandomAccessPipelineModule import SingleVariationRandomAccessPipelineModule
 from mgds.util.PersistentCacheState import PersistentCacheState
 from mgds.util.FileUtil import safe_write_json_file
@@ -107,6 +108,63 @@ class DiskCache(
 
     def get_outputs(self) -> list[str]:
         return self.split_names + self.aggregate_names
+
+    def _get_persistent_key(self, variation: int, index: int) -> str | None:
+        """
+        Look up the persistent key (e.g. image_path) for a given index by walking
+        backward through the pipeline, skipping other DiskCache modules.
+
+        When multiple DiskCache modules are chained (e.g. image cache -> text cache),
+        a downstream cache's in_index values come from the original data source
+        (CollectPaths), not from the upstream cache's output space. The upstream cache
+        may have a different (smaller) output length due to balancing, causing
+        IndexError when the downstream cache tries to look up persistent keys through
+        the upstream cache. By skipping DiskCache modules, we reach the original data
+        source directly.
+        """
+        if self.persistent_key_in_name is None:
+            return None
+
+        split_name = self.persistent_key_in_name.split('.')
+        item_name = split_name[0]
+        path_names = split_name[1:]
+
+        # Walk backward through pipeline modules, skipping other DiskCache instances
+        # noinspection PyUnresolvedReferences
+        for prev_idx in range(self._PipelineModule__module_index - 1, -1, -1):
+            module = self.pipeline.modules[prev_idx]
+
+            if item_name not in module.get_outputs():
+                continue
+
+            # Skip other DiskCache modules — they have a different index space
+            if isinstance(module, DiskCache):
+                continue
+
+            try:
+                if isinstance(module, RandomAccessPipelineModule):
+                    item = module.get_item(variation, index, item_name)
+                elif isinstance(module, SingleVariationRandomAccessPipelineModule):
+                    item = module.get_item(index, item_name)
+                else:
+                    continue
+
+                if item is None:
+                    continue
+
+                result = item[item_name]
+                for path_name in path_names:
+                    if isinstance(result, dict) and path_name in result:
+                        result = result[path_name]
+                    else:
+                        result = None
+                        break
+                if result is not None:
+                    return result
+            except (IndexError, KeyError):
+                continue
+
+        return None
 
     def __string_key(self, data: list[Any]) -> str:
         json_data = json.dumps(data, sort_keys=True, ensure_ascii=True, separators=(',', ':'), indent=None)
@@ -228,10 +286,14 @@ class DiskCache(
                     # Map each `group_index` to a persistent key--a value that will always be the
                     # same for the file (or the file's data in a perfect world), so that our
                     # persistent cache has a stable value to reference this file by.
-                    group_index_mappings = {group_index: self._get_previous_item(out_variation,
-                                                                                 self.persistent_key_in_name,
-                                                                                 in_index)
-                                            for group_index, in_index in enumerate(self.group_indices[group_key])}
+                    group_index_mappings = {}
+                    for group_index, in_index in enumerate(self.group_indices[group_key]):
+                        key = self._get_persistent_key(out_variation, in_index)
+                        if key is None:
+                            # Fall back to unstable index key; this item will be
+                            # re-cached because the key won't match any prior entry.
+                            key = str(group_index)
+                        group_index_mappings[group_index] = key
 
                     # Compute file metadata (mtime + size) for content change detection
                     persistent_key_metadata = {}
@@ -339,10 +401,30 @@ class DiskCache(
     def get_item(self, index: int, requested_name: str = None) -> dict:
         item = {}
 
-        group_key, in_variation, group_index, in_index = self.__get_input_index(self.current_variation, index)
+        result = self.__get_input_index(self.current_variation, index)
+        if result is None:
+            total = sum(self.group_output_samples.values())
+            raise IndexError(
+                f"DiskCache index {index} out of range (total output samples: {total}, "
+                f"current_variation: {self.current_variation})"
+            )
+        group_key, in_variation, group_index, in_index = result
 
         if requested_name is None or requested_name in self.aggregate_names:
-            aggregate_item: dict[str, Any] = self.aggregate_cache[group_key][in_variation][group_index]
+            variation_cache = self.aggregate_cache[group_key][in_variation]
+            if variation_cache is None:
+                raise RuntimeError(
+                    f"DiskCache: aggregate cache for group {group_key[:14]} variation "
+                    f"{in_variation} is None (not loaded). current_variation="
+                    f"{self.current_variation}, index={index}"
+                )
+            aggregate_item: dict[str, Any] = variation_cache[group_index]
+            if aggregate_item is None:
+                raise RuntimeError(
+                    f"DiskCache: aggregate cache entry is None at group_index={group_index} "
+                    f"(group={group_key[:14]}, variation={in_variation}). This may indicate "
+                    f"a corrupted or partially-written cache. Try deleting the cache directory."
+                )
             item = aggregate_item.copy()
 
         if requested_name is None or requested_name in self.split_names:
