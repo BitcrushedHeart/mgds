@@ -1,14 +1,13 @@
 """Quick smoke test for SmartDiskCache as DiskCache replacement."""
 import json
 import os
-import tempfile
 
 import torch
 
 from mgds.MGDS import MGDS
 from mgds.OutputPipelineModule import OutputPipelineModule
 from mgds.PipelineModule import PipelineModule, PipelineState
-from mgds.pipelineModules.SmartDiskCache import SmartDiskCache
+from mgds.pipelineModules.SmartDiskCache import SmartDiskCache, CACHE_VERSION
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
 
 
@@ -91,7 +90,7 @@ def test_smartcache_creates_cache_json(tmp_path):
 
     assert 'entries' in index
     assert 'hash_index' in index
-    assert index.get('version') == 1
+    assert index.get('version') == CACHE_VERSION
 
 
 def test_smartcache_no_source_path_fallback(tmp_path):

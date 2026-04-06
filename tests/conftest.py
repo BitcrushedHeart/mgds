@@ -1,12 +1,9 @@
 import os
-import shutil
 import torch
 import pytest
 from mgds.PipelineModule import PipelineModule, PipelineState
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
 from mgds.LoadingPipeline import LoadingPipeline
-from mgds.OutputPipelineModule import OutputPipelineModule
-from mgds.pipelineModules.SmartDiskCache import SmartDiskCache
 
 
 class FakeSourceModule(PipelineModule, RandomAccessPipelineModule):
@@ -18,13 +15,14 @@ class FakeSourceModule(PipelineModule, RandomAccessPipelineModule):
     - Tensor data for aggregate_names (e.g. 'crop_resolution')
     """
     def __init__(self, file_dir: str, files: list[str], split_data: dict = None, aggregate_data: dict = None,
-                 source_path_out_name: str = 'image_path'):
+                 source_path_out_name: str = 'image_path', concepts_per_file: list[dict] = None):
         super().__init__()
         self.file_dir = file_dir
         self.files = files
         self.split_data = split_data or {}
         self.aggregate_data = aggregate_data or {}
         self.source_path_out_name = source_path_out_name
+        self.concepts_per_file = concepts_per_file
 
     def length(self) -> int:
         return len(self.files)
@@ -36,6 +34,8 @@ class FakeSourceModule(PipelineModule, RandomAccessPipelineModule):
         outputs = [self.source_path_out_name]
         outputs.extend(self.split_data.keys())
         outputs.extend(self.aggregate_data.keys())
+        if self.concepts_per_file is not None:
+            outputs.append('concept')
         return outputs
 
     def get_item(self, variation: int, index: int, requested_name: str = None) -> dict:
@@ -44,6 +44,8 @@ class FakeSourceModule(PipelineModule, RandomAccessPipelineModule):
             item[name] = tensor_fn(variation, index)
         for name, tensor_fn in self.aggregate_data.items():
             item[name] = tensor_fn(variation, index)
+        if self.concepts_per_file is not None:
+            item['concept'] = self.concepts_per_file[index]
         return item
 
 
