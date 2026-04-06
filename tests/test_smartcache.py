@@ -1086,3 +1086,55 @@ class TestIntegration:
         for b in batches:
             assert "latent" in b
             assert "crop_resolution" in b
+
+
+# ---------------------------------------------------------------------------
+# Rebuild hash_index cleanup regression test
+# ---------------------------------------------------------------------------
+
+class TestRebuildHashIndexCleanup:
+    def test_rebuild_cleans_hash_index(self, tmp_path):
+        """When _validate_entry returns 'rebuild', the old hash must be
+        removed from hash_index before re-queuing — otherwise a stale
+        pointer is left in hash_index."""
+        from unittest.mock import patch
+
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        src_file = _create_source_file(src_dir, "test.bin", b"original content")
+
+        paths = [src_file]
+        tensors = _make_tensors(1)
+        dummy_data = {"latent": tensors, "image_path": paths}
+        ds, cache_dir, _ = _build_smart_pipeline(
+            tmp_path, [{}], dummy_data, 1,
+            split_names=["latent"], aggregate_names=[],
+            modeltype="testmodel", source_path_in_name="image_path",
+        )
+        _drain(ds)
+
+        idx = _read_cache_json(cache_dir)
+        fp = os.path.normpath(src_file)
+        old_hash = idx["entries"][fp]["hash"]
+        assert fp in idx["hash_index"][old_hash]
+
+        # Change file content AND make getmtime fail once to trigger 'rebuild'
+        with open(src_file, "wb") as f:
+            f.write(b"completely new content")
+
+        original_getmtime = os.path.getmtime
+        call_count = [0]
+        def flaky_getmtime(path):
+            if os.path.normpath(path) == fp and call_count[0] == 0:
+                call_count[0] += 1
+                raise OSError("simulated access error")
+            return original_getmtime(path)
+
+        with patch("os.path.getmtime", side_effect=flaky_getmtime):
+            _drain(ds)
+
+        idx_after = _read_cache_json(cache_dir)
+        new_hash = idx_after["entries"][fp]["hash"]
+        assert new_hash != old_hash
+        if old_hash in idx_after["hash_index"]:
+            assert fp not in idx_after["hash_index"][old_hash]
