@@ -14,7 +14,14 @@ import time
 from mgds.MGDS import MGDS
 from mgds.OutputPipelineModule import OutputPipelineModule
 from mgds.PipelineModule import PipelineModule, PipelineState
-from mgds.pipelineModules.SmartDiskCache import CACHE_VERSION, SmartDiskCache
+from mgds.pipelineModules.AspectBucketing import AspectBucketing
+from mgds.pipelineModules.SmartDiskCache import (
+    CACHE_VERSION,
+    MAX_ROLE_STAMPS,
+    MAX_ROLE_VALIDATION_TOKENS,
+    SCHEMA_METHOD,
+    SmartDiskCache,
+)
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
 
 import torch
@@ -1519,6 +1526,230 @@ class TestFastValidation:
         captured = capsys.readouterr()
         assert "Fast validation passed" not in captured.out
 
+    # --- adaptive resolution: multi-target but deterministic -----------------
+
+    def test_adaptive_cache_takes_fast_path_on_second_start(self, tmp_path, capsys):
+        sources = _adaptive_dataset(tmp_path, "sft")
+        ds1, cache1, _ = _build_adaptive_pipeline(tmp_path, sources)
+        assert len(_drain(ds1)) == 3
+        stat_before = _index_stat(cache1.cache_dir)
+        capsys.readouterr()
+        time.sleep(0.05)
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources)
+        saves = _CallCounter(cache2, "_save_cache_index")
+        batches = _drain(ds2)
+
+        out = capsys.readouterr().out
+        assert "Fast validation passed" in out
+        assert "3 adaptive variants verified" in out
+        assert len(batches) == 3
+        assert saves.count == 0
+        assert _index_stat(cache2.cache_dir) == stat_before
+        # The fast path serves the same per-row aggregates the build produced.
+        assert cache2._aggregate_cache == cache1._aggregate_cache
+
+    def test_adaptive_missing_required_variant_forces_full_validation(self, tmp_path, capsys):
+        sources = _adaptive_dataset(tmp_path, "sft")
+        ds1, cache1, _ = _build_adaptive_pipeline(tmp_path, sources)
+        _drain(ds1)
+        fp = os.path.normpath(sources["paths"][0])
+        idx = _read_cache_json(cache1.cache_dir)
+        (required_key, variant), = idx["entries"][fp]["variants"].items()
+        # The entry still has *a* variant whose _1.pt exists (so the legacy
+        # spot-check passes) but not the tier this row requires.
+        idx["entries"][fp]["variants"] = {"64x64": variant}
+        _write_cache_json(cache1.cache_dir, idx)
+        capsys.readouterr()
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources)
+        saves = _CallCounter(cache2, "_save_cache_index")
+        assert len(_drain(ds2)) == 3
+
+        out = capsys.readouterr().out
+        assert "adaptive fast validation declined" in out
+        assert f"missing variant {required_key}" in out
+        assert "Fast validation passed" not in out
+        assert saves.count >= 1
+        assert required_key in _read_cache_json(cache1.cache_dir)["entries"][fp]["variants"]
+
+    def test_adaptive_missing_variant_pt_forces_rebuild_and_save(self, tmp_path, capsys):
+        sources = _adaptive_dataset(tmp_path, "sft")
+        ds1, cache1, _ = _build_adaptive_pipeline(tmp_path, sources)
+        _drain(ds1)
+        fp0 = os.path.normpath(sources["paths"][0])
+        fp1 = os.path.normpath(sources["paths"][1])
+        idx = _read_cache_json(cache1.cache_dir)
+        (required_key, variant), = idx["entries"][fp0]["variants"].items()
+        other_variant = next(iter(idx["entries"][fp1]["variants"].values()))
+        # A decoy first variant keeps the any-variant spot-check happy while
+        # the required variant's tensor file is gone.
+        idx["entries"][fp0]["variants"] = {"64x64": dict(other_variant), required_key: variant}
+        _write_cache_json(cache1.cache_dir, idx)
+        pt_path = os.path.join(cache1.cache_dir, f"{variant['cache_file']}_1.pt")
+        os.remove(pt_path)
+        capsys.readouterr()
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources)
+        saves = _CallCounter(cache2, "_save_cache_index")
+        _drain(ds2)
+
+        out = capsys.readouterr().out
+        assert "adaptive fast validation declined" in out
+        assert "_1.pt" in out
+        assert os.path.isfile(pt_path), "the variant pop must rebuild the missing tensor"
+        assert saves.count >= 1, "a popped + rebuilt variant must reach cache.json"
+        assert required_key in _read_cache_json(cache1.cache_dir)["entries"][fp0]["variants"]
+
+    def test_adaptive_unstamped_resolution_declines_without_upstream_read(self, tmp_path, capsys):
+        sources = _adaptive_dataset(tmp_path, "dpo")
+        ds1, _cache1, _ = _build_adaptive_pipeline(tmp_path, sources, role="dpo")
+        _drain(ds1)
+
+        ds2, cache2, dummy2 = _build_adaptive_pipeline(tmp_path, sources, role="dpo")
+        _drain(ds2)
+        assert "Fast validation passed" in capsys.readouterr().out
+
+        # Guard level: an unstamped constraint is rejected before any resolve,
+        # i.e. without walking upstream.
+        fp = os.path.normpath(sources["paths"][0])
+        entry = cache2.cache_index["entries"][fp]
+        saved_stamp = entry["source_resolutions"].pop("original_resolution_rejected")
+        reads_before = sum(dummy2.reads.values())
+        verified, reason = cache2._adaptive_fast_path_guard(dict(cache2._source_path_cache), cache2._epoch_keys[0])
+        assert verified is None
+        assert "unstamped source resolutions" in reason
+        assert sum(dummy2.reads.values()) == reads_before
+        entry["source_resolutions"]["original_resolution_rejected"] = saved_stamp
+
+        # Pipeline level: the same gap on disk falls back to full validation.
+        idx = _read_cache_json(cache2.cache_dir)
+        idx["entries"][fp]["source_resolutions"].pop("original_resolution_rejected")
+        _write_cache_json(cache2.cache_dir, idx)
+        ds3, _cache3, _ = _build_adaptive_pipeline(tmp_path, sources, role="dpo")
+        _drain(ds3)
+        out = capsys.readouterr().out
+        assert "adaptive fast validation declined" in out
+        assert "Fast validation passed" not in out
+
+    def test_adaptive_unrecorded_sidecar_declines_fast_path(self, tmp_path, capsys):
+        sources = _adaptive_dataset(tmp_path, "dpo")
+        late_rejected = os.path.join(str(tmp_path / "src_dpo_rejected"), "late.bin")
+        sources["rejected_paths"][0] = late_rejected  # absent at build time
+        ds1, _cache1, _ = _build_adaptive_pipeline(tmp_path, sources, role="dpo")
+        _drain(ds1)
+        _create_source_file(tmp_path / "src_dpo_rejected", "late.bin", b"appeared later")
+        capsys.readouterr()
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources, role="dpo")
+        saves = _CallCounter(cache2, "_save_cache_index")
+        _drain(ds2)
+
+        out = capsys.readouterr().out
+        assert "unrecorded sidecar" in out
+        assert "Fast validation passed" not in out
+        assert saves.count >= 1
+        fp = os.path.normpath(sources["paths"][0])
+        stored = _read_cache_json(cache2.cache_dir)["entries"][fp]["sidecar_mtimes"]
+        assert os.path.normpath(late_rejected) in stored
+
+    def test_trust_mode_never_runs_adaptive_guard_and_does_not_rewrite(self, tmp_path, capsys):
+        sources = _adaptive_dataset(tmp_path, "sft")
+        ds1, cache1, _ = _build_adaptive_pipeline(tmp_path, sources)
+        _drain(ds1)
+        stat_before = _index_stat(cache1.cache_dir)
+        time.sleep(0.05)
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources, trust_cache=True)
+        guard = _CallCounter(cache2, "_adaptive_fast_path_guard")
+        saves = _CallCounter(cache2, "_save_cache_index")
+        assert len(_drain(ds2)) == 3
+
+        assert guard.count == 0
+        assert saves.count == 0
+        assert _index_stat(cache2.cache_dir) == stat_before
+
+    def test_adaptive_restamp_on_fast_path_is_saved(self, tmp_path, capsys):
+        sources = _adaptive_dataset(tmp_path, "sft")
+        ds1, cache1, _ = _build_adaptive_pipeline(tmp_path, sources)
+        _drain(ds1)
+        fp = os.path.normpath(sources["paths"][0])
+        idx = _read_cache_json(cache1.cache_dir)
+        assert idx["entries"][fp]["adaptive_max_resolution"] == 512
+        idx["entries"][fp]["adaptive_max_resolution"] = 1024  # stale cap
+        _write_cache_json(cache1.cache_dir, idx)
+        capsys.readouterr()
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources)
+        saves = _CallCounter(cache2, "_save_cache_index")
+        _drain(ds2)
+
+        assert "Fast validation passed" in capsys.readouterr().out
+        assert saves.count == 1
+        assert _read_cache_json(cache1.cache_dir)["entries"][fp]["adaptive_max_resolution"] == 512
+
+    def test_adaptive_trust_mode_restamp_is_saved(self, tmp_path):
+        sources = _adaptive_dataset(tmp_path, "sft")
+        ds1, cache1, _ = _build_adaptive_pipeline(tmp_path, sources)
+        _drain(ds1)
+        fp = os.path.normpath(sources["paths"][0])
+        idx = _read_cache_json(cache1.cache_dir)
+        idx["entries"][fp]["adaptive_max_resolution"] = 1024
+        _write_cache_json(cache1.cache_dir, idx)
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources, trust_cache=True)
+        saves = _CallCounter(cache2, "_save_cache_index")
+        _drain(ds2)
+
+        assert saves.count == 1
+        assert _read_cache_json(cache1.cache_dir)["entries"][fp]["adaptive_max_resolution"] == 512
+
+    def test_adaptive_epoch_key_reuse_matches_fresh_resolution(self, tmp_path, capsys):
+        """Aggregates loaded with the guard's proven keys must equal a load that
+        re-resolves every row, on both the synthesis and the tensor-read path."""
+        sources = _adaptive_dataset(tmp_path, "dpo")
+        ds1, _cache1, _ = _build_adaptive_pipeline(tmp_path, sources, role="dpo")
+        _drain(ds1)
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources, role="dpo")
+        _drain(ds2)
+        assert "Fast validation passed" in capsys.readouterr().out
+        out_variation, keys = cache2._epoch_keys
+        assert len(keys) == 3
+
+        expected_keys = {
+            in_index: cache2._fast_resolution_string(cache2.cache_index["entries"][fp], out_variation, in_index)
+            for in_index, fp in cache2._source_path_cache.items()
+        }
+        assert keys == expected_keys
+
+        def load(reuse: bool) -> dict:
+            cache2._epoch_keys = (out_variation, keys) if reuse else None
+            cache2._aggregate_cache = {}
+            resolves = _CallCounter(cache2, "_fast_resolution_string")
+            cache2._load_aggregate_cache(out_variation)
+            del cache2._fast_resolution_string
+            return dict(cache2._aggregate_cache), resolves.count
+
+        with_reuse, reuse_resolves = load(True)
+        without_reuse, fresh_resolves = load(False)
+        assert with_reuse == without_reuse
+        assert reuse_resolves == 0
+        assert fresh_resolves > 0
+
+        # Tensor-read path: drop the crop_resolution stamps (in memory only)
+        # so synthesis declines and the per-row slow path runs.
+        for entry in cache2.cache_index["entries"].values():
+            for variant in entry["variants"].values():
+                variant.pop("crop_resolution", None)
+        cache2._save_cache_index = lambda *a, **k: None  # slow path re-stamps; keep disk as-is
+        slow_with_reuse, _ = load(True)
+        for entry in cache2.cache_index["entries"].values():
+            for variant in entry["variants"].values():
+                variant.pop("crop_resolution", None)
+        slow_without_reuse, _ = load(False)
+        assert slow_with_reuse == slow_without_reuse == with_reuse
+
 
 # ---------------------------------------------------------------------------
 # Session-level skip (no per-epoch revalidation within one process)
@@ -2140,9 +2371,12 @@ class TestWatchedFingerprint:
         _drain(ds)
         capsys.readouterr()
 
-        # Strip the fingerprint from cache.json to simulate a legacy cache.
+        # Strip the fingerprint from cache.json to simulate a legacy cache
+        # (one written before per-role stamps, so no roles table either).
         idx = _read_cache_json(cache_dir)
         idx.pop("watched_fingerprints", None)
+        idx.pop("roles", None)
+        idx.pop("last_role", None)
         with open(os.path.join(cache_dir, "cache.json"), "w") as f:
             json.dump(idx, f)
 
@@ -2925,6 +3159,165 @@ class TestBucketMethodStamping:
         _drain(ds)
         index = _read_cache_json(cache_dir)
         assert "bucket_method" not in index
+
+    # --- per-role stamps (instances with different configs sharing one dir) ---
+
+    def test_role_stamps_and_legacy_top_level_mirror(self, tmp_path):
+        sources = {"sft": _adaptive_dataset(tmp_path, "sft"), "dpo": _adaptive_dataset(tmp_path, "dpo")}
+        ds_sft, cache_sft, _ = _build_adaptive_pipeline(tmp_path, sources["sft"])
+        ds_dpo, cache_dpo, _ = _build_adaptive_pipeline(tmp_path, sources["dpo"], role="dpo")
+        _drain(ds_sft)
+        _drain(ds_dpo)
+
+        idx = _read_cache_json(cache_sft.cache_dir)
+        roles = idx["roles"]
+        sft_sig, dpo_sig = cache_sft._role_signature(), cache_dpo._role_signature()
+        assert set(roles) == {sft_sig, dpo_sig}
+        assert roles[sft_sig]["bucket_method"] != roles[dpo_sig]["bucket_method"]
+        assert roles[dpo_sig]["schema"] == ["crop_resolution", "latent", "latent_rejected"]
+        assert roles[sft_sig]["schema"] == ["crop_resolution", "latent"]
+        # Top level mirrors the last saver with the legacy key names and types,
+        # which is all an older mgds reads.
+        assert idx["last_role"] == dpo_sig
+        assert idx["bucket_method"] == roles[dpo_sig]["bucket_method"]
+        assert idx["schema"] == roles[dpo_sig]["schema"]
+        assert idx["schema_method"] == SCHEMA_METHOD
+        assert isinstance(idx["last_validated"], float)
+        assert isinstance(idx["watched_fingerprints"], dict) and idx["watched_fingerprints"]
+        for fingerprint in idx["watched_fingerprints"].values():
+            assert isinstance(fingerprint, list) and len(fingerprint) == 2
+
+    def test_ladder_change_drifts_only_that_role(self, tmp_path, capsys):
+        sources = {"sft": _adaptive_dataset(tmp_path, "sft"), "dpo": _adaptive_dataset(tmp_path, "dpo")}
+        _shared_cache_start(tmp_path, sources, capsys)
+        roles_before = _read_cache_json(str(tmp_path / "cache"))["roles"]
+
+        result = _shared_cache_start(tmp_path, sources, capsys, sft_kwargs={"ladder": "1024,768,512,256"})
+
+        assert result["sft"]["drift"] == 1
+        assert "Fast validation passed" not in result["sft"]["out"]
+        assert result["dpo"]["drift"] == 0
+        assert "Fast validation passed" in result["dpo"]["out"]
+        roles_after = _read_cache_json(str(tmp_path / "cache"))["roles"]
+        sft_sig = result["sft"]["cache"]._role_signature()
+        dpo_sig = result["dpo"]["cache"]._role_signature()
+        assert roles_after[sft_sig]["bucket_method"] != roles_before[sft_sig]["bucket_method"]
+        assert roles_after[dpo_sig]["bucket_method"] == roles_before[dpo_sig]["bucket_method"]
+
+    def test_legacy_index_without_roles_adopts_top_level_stamps(self, tmp_path, capsys):
+        sources = _adaptive_dataset(tmp_path, "sft")
+        ds1, cache1, _ = _build_adaptive_pipeline(tmp_path, sources)
+        _drain(ds1)
+        idx = _read_cache_json(cache1.cache_dir)
+        idx.pop("roles")
+        idx.pop("last_role")
+        _write_cache_json(cache1.cache_dir, idx)
+        capsys.readouterr()
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources)
+        saves = _CallCounter(cache2, "_save_cache_index")
+        drift = _CallCounter(cache2, "_drift_recovery_pass")
+        _drain(ds2)
+
+        assert "Fast validation passed" in capsys.readouterr().out
+        assert drift.count == 0
+        assert saves.count == 0, "adopting legacy stamps must not rewrite the index by itself"
+
+    def test_stale_role_augments_names_another_role_dropped(self, tmp_path, monkeypatch):
+        """Role B (wider schema) shares a file with role A. A rebuilds the file
+        after a content edit, writing only its own names. B, even in trust mode,
+        must notice from the index schema_keys and backfill its missing name."""
+        src_dir = tmp_path / "sources"
+        paths = [_create_source_file(src_dir, f"s{i}.bin", f"s{i}".encode()) for i in range(2)]
+        latents = _make_tensors(2, seed=5)
+        extras = _make_tensors(2, seed=6)
+        data = {"latent": latents, "extra": extras, "image_path": paths}
+
+        def run(split_names):
+            ds, cache_dir, _ = _build_smart_pipeline(
+                tmp_path,
+                concepts=[{"name": "A", "path": "dummy"}],
+                dummy_data=data,
+                dummy_length=2,
+                split_names=split_names,
+                aggregate_names=[],
+                source_path_in_name="image_path",
+            )
+            _drain(ds)
+            return cache_dir
+
+        cache_dir = run(["latent", "extra"])  # role B builds
+        run(["latent"])  # role A validates (no rebuild needed)
+        with open(paths[0], "wb") as f:
+            f.write(b"edited content")
+        os.utime(paths[0], (time.time() + 10, time.time() + 10))
+        run(["latent"])  # role A rebuilds s0 with only 'latent'
+        fp = os.path.normpath(paths[0])
+        a_variant = next(iter(_read_cache_json(cache_dir)["entries"][fp]["variants"].values()))
+        assert a_variant["schema_keys"] == ["latent"]
+
+        monkeypatch.setenv("OT_SKIP_CACHE_VALIDATION", "1")
+        run(["latent", "extra"])  # role B, trust mode
+
+        b_variant = next(iter(_read_cache_json(cache_dir)["entries"][fp]["variants"].values()))
+        assert set(b_variant["schema_keys"]) >= {"latent", "extra"}
+        pt = torch.load(os.path.join(cache_dir, f"{b_variant['cache_file']}_1.pt"), weights_only=False)
+        assert "extra" in pt
+
+    def test_other_roles_full_validation_cannot_vouch_for_edited_rows(self, tmp_path, capsys):
+        """Tokens are scoped to a role's own rows: role A's full validation after
+        role B's file was edited must not let B's next start fast-pass."""
+        a_paths = [_create_source_file(tmp_path / "a", f"a{i}.bin", f"a{i}".encode()) for i in range(2)]
+        b_paths = [_create_source_file(tmp_path / "b", f"b{i}.bin", f"b{i}".encode()) for i in range(2)]
+        tensors = _make_tensors(2, seed=8)
+
+        def run(paths, split_names):
+            ds, cache_dir, _ = _build_smart_pipeline(
+                tmp_path,
+                concepts=[{"name": "A", "path": "dummy"}],
+                dummy_data={"latent": tensors, "extra": tensors, "image_path": paths},
+                dummy_length=2,
+                split_names=split_names,
+                aggregate_names=[],
+                source_path_in_name="image_path",
+            )
+            _drain(ds)
+            return cache_dir
+
+        cache_dir = run(a_paths, ["latent"])
+        run(b_paths, ["latent", "extra"])
+        b_fp = os.path.normpath(b_paths[0])
+        old_hash = _read_cache_json(cache_dir)["entries"][b_fp]["hash"]
+        with open(b_paths[0], "wb") as f:
+            f.write(b"b0 edited")
+        os.utime(b_paths[0], (time.time() + 10, time.time() + 10))
+        os.utime(a_paths[0], (time.time() + 20, time.time() + 20))  # force A's full validation
+        run(a_paths, ["latent"])
+        capsys.readouterr()
+
+        run(b_paths, ["latent", "extra"])
+
+        assert "Fast validation passed" not in capsys.readouterr().out
+        assert _read_cache_json(cache_dir)["entries"][b_fp]["hash"] != old_hash
+
+    def test_role_and_token_tables_are_capped(self):
+        sdc = SmartDiskCache.__new__(SmartDiskCache)
+        sdc.cache_index = {"entries": {}}
+        sdc._index_lock = __import__("threading").Lock()
+        for i in range(MAX_ROLE_STAMPS + 3):
+            assert sdc._stamp_role(f"role{i}", schema=[str(i)], schema_method=SCHEMA_METHOD)
+            sdc.cache_index["roles"][f"role{i}"]["updated"] = float(i)
+        roles = sdc.cache_index["roles"]
+        assert len(roles) == MAX_ROLE_STAMPS
+        assert "role0" not in roles and f"role{MAX_ROLE_STAMPS + 2}" in roles
+        assert not sdc._stamp_role(f"role{MAX_ROLE_STAMPS + 2}", schema=[str(MAX_ROLE_STAMPS + 2)])
+
+        for i in range(MAX_ROLE_VALIDATION_TOKENS + 2):
+            token = {"last_validated": float(i), "watched_fingerprints": {}}
+            sdc._stamp_role_validation("role9", f"digest{i}", token)
+        validations = sdc.cache_index["roles"]["role9"]["validations"]
+        assert len(validations) == MAX_ROLE_VALIDATION_TOKENS
+        assert "digest0" not in validations and f"digest{MAX_ROLE_VALIDATION_TOKENS + 1}" in validations
 
 
 class TestGCWalksVariants:
@@ -3795,3 +4188,442 @@ class TestMultiresVariantSessionSkip:
         assert any("384x384" in keys for keys in built.values()), (
             f"new variant '384x384' should have been built; got {built}"
         )
+
+    def test_non_adaptive_multires_still_bypasses_fast_validation_without_rewrite(self, tmp_path, capsys):
+        """Random multi-target keeps full validation (the variant rotates per
+        epoch), but a clean pass no longer rewrites the index."""
+        def setup_with_stable_mtimes():
+            # _setup rewrites the (identical) source files; pin their mtimes so
+            # the restart really is untouched.
+            ds, cache_dir, cm = self._setup(tmp_path, self._stable)
+            for name in ("i0.bin", "i1.bin"):
+                os.utime(tmp_path / "src" / name, (1_700_000_000, 1_700_000_000))
+            return ds, cache_dir, cm
+
+        ds1, cache_dir, _cm = setup_with_stable_mtimes()
+        _drain(ds1)
+        stat_before = _index_stat(cache_dir)
+        capsys.readouterr()
+        time.sleep(0.05)
+
+        ds2, _cd2, cm2 = setup_with_stable_mtimes()
+        saves = _CallCounter(cm2, "_save_cache_index")
+        _drain(ds2)
+
+        assert "Fast validation passed" not in capsys.readouterr().out
+        assert saves.count == 0
+        assert _index_stat(cache_dir) == stat_before
+
+    def test_adaptive_fast_path_feeds_variant_session_skip(self, tmp_path, capsys):
+        sources = _adaptive_dataset(tmp_path, "sft")
+        ds1, _cache1, _ = _build_adaptive_pipeline(tmp_path, sources)
+        _drain(ds1)
+        capsys.readouterr()
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources)
+        saves = _CallCounter(cache2, "_save_cache_index")
+        _drain(ds2)
+        assert "Fast validation passed" in capsys.readouterr().out
+
+        assert len(_drain(ds2)) == 3
+        assert "3 variants already validated this run" in capsys.readouterr().out
+        assert saves.count == 0
+
+
+# ---------------------------------------------------------------------------
+# Adaptive resolution / shared cache-dir helpers
+# ---------------------------------------------------------------------------
+
+ADAPTIVE_LADDER = "1024,768,512,256,128"
+
+
+class _CountingDataModule(DummyDataModule):
+    """DummyDataModule that counts upstream item reads by requested name."""
+
+    def __init__(self, data: dict[str, list], length: int):
+        super().__init__(data, length)
+        self.reads: dict[str | None, int] = {}
+
+    def get_item(self, variation: int, index: int, requested_name: str = None) -> dict:
+        self.reads[requested_name] = self.reads.get(requested_name, 0) + 1
+        return super().get_item(variation, index, requested_name)
+
+
+class _CallCounter:
+    """Wrap an instance method in place and count its calls."""
+
+    def __init__(self, obj, name: str):
+        self.count = 0
+        original = getattr(obj, name)
+
+        def wrapper(*args, **kwargs):
+            self.count += 1
+            return original(*args, **kwargs)
+
+        setattr(obj, name, wrapper)
+
+
+def _index_stat(cache_dir: str) -> tuple[int, int]:
+    st = os.stat(os.path.join(cache_dir, "cache.json"))
+    return st.st_size, st.st_mtime_ns
+
+
+def _write_cache_json(cache_dir: str, index: dict) -> None:
+    with open(os.path.join(cache_dir, "cache.json"), "w") as f:
+        json.dump(index, f)
+
+
+def _adaptive_dataset(tmp_path, role: str, n: int = 3) -> dict:
+    """Source files + stamped resolutions for one loader role.
+
+    Resolutions straddle the 512/256 tiers so rows land on different adaptive
+    tiers; the DPO role's second rejected image is small enough to cap its
+    pair a tier lower than the chosen image alone would allow.
+    """
+    src = tmp_path / f"src_{role}"
+    resolutions = [(600, 600), (700, 520), (400, 300)]
+    sources = {
+        "paths": [_create_source_file(src, f"{role}_{i}.bin", f"{role}-{i}".encode()) for i in range(n)],
+        "resolutions": [resolutions[i % 3] for i in range(n)],
+    }
+    if role == "dpo":
+        rejected_dir = tmp_path / "src_dpo_rejected"
+        rejected = [(600, 600), (300, 300), (400, 300)]
+        sources["rejected_paths"] = [
+            _create_source_file(rejected_dir, f"rejected_{i}.bin", f"rejected-{i}".encode()) for i in range(n)
+        ]
+        sources["rejected_resolutions"] = [rejected[i % 3] for i in range(n)]
+    return sources
+
+
+def _build_adaptive_pipeline(
+    tmp_path,
+    sources: dict,
+    *,
+    role: str = "sft",
+    ladder: str = ADAPTIVE_LADDER,
+    target: str = "512",
+    trust_cache: bool = False,
+):
+    """Mirror OneTrainer's adaptive image-cache wiring on tmp_path/'cache'.
+
+    ``role='sft'`` is the main loader (rlhf off). ``role='dpo'`` is the DPO
+    add-on loader: an extra rejected latent, the rejected source resolution
+    constraining the adaptive tier, and the rejected image watched as a
+    sidecar. Returns (ds, cache_module, upstream_module).
+    """
+    n = len(sources["paths"])
+    dpo = role == "dpo"
+    data = {
+        "image_path": sources["paths"],
+        "latent": _make_tensors(n, seed=3),
+        "original_resolution": sources["resolutions"],
+        "target_resolution": [target],
+        "enable_override": [False],
+        "resolution_override": [target],
+        "target_frames": ["1"],
+    }
+    if dpo:
+        data["latent_rejected"] = _make_tensors(n, seed=4)
+        data["original_resolution_rejected"] = sources["rejected_resolutions"]
+        data["image_path_rejected"] = sources["rejected_paths"]
+    upstream = _CountingDataModule(data=data, length=n)
+    additional = ["original_resolution_rejected"] if dpo else []
+    bucketing = AspectBucketing(
+        quantization=64,
+        resolution_in_name="original_resolution",
+        target_resolution_in_name="target_resolution",
+        enable_target_resolutions_override_in_name="enable_override",
+        target_resolutions_override_in_name="resolution_override",
+        target_frames_in_name="target_frames",
+        frame_dim_enabled=False,
+        scale_resolution_out_name="scale_resolution",
+        crop_resolution_out_name="crop_resolution",
+        possible_resolutions_out_name="possible_resolutions",
+        adaptive_resolution=True,
+        additional_resolution_in_names=additional,
+        adaptive_resolution_ladder=ladder,
+    )
+
+    def rebucket_provider(aspect, _ab=bucketing):
+        return [f"{h}x{w}" for h, w in (_ab.bucket_for_aspect(aspect, t) for t in _ab.bucket_resolutions)]
+
+    split_names = ["latent", "latent_rejected"] if dpo else ["latent"]
+    cache_mod = SmartDiskCache(
+        cache_dir=str(tmp_path / "cache"),
+        split_names=split_names,
+        aggregate_names=["crop_resolution"],
+        modeltype="testmodel",
+        source_path_in_name="image_path",
+        bucket_method_provider=bucketing.compute_bucket_method_hash,
+        rebucket_provider=rebucket_provider,
+        aspect_bucketing=bucketing,
+        extra_watched_paths_in_names=["image_path_rejected"] if dpo else None,
+        trust_cache=trust_cache,
+        adaptive_resolution=True,
+        adaptive_resolution_ladder=ladder,
+        additional_resolution_in_names=additional or None,
+        adaptive_resolution_max=int(target),
+    )
+    output_mod = OutputPipelineModule(names=split_names + ["crop_resolution"])
+    ds = MGDS(
+        device=torch.device("cpu"),
+        concepts=[{"name": role, "path": "dummy"}],
+        settings={},
+        definition=[[upstream], [bucketing], [cache_mod], [output_mod]],
+        batch_size=1,
+        state=PipelineState(),
+        seed=42,
+    )
+    return ds, cache_mod, upstream
+
+
+def _shared_cache_start(tmp_path, sources, capsys, *, order=("sft", "dpo"), sft_kwargs=None, dpo_kwargs=None):
+    """One simulated process start of an SFT + DPO run.
+
+    Both loaders are constructed fresh (empty session state) on the same cache
+    dir, then each refreshes once in ``order``.
+    """
+    loaders = {
+        "sft": _build_adaptive_pipeline(tmp_path, sources["sft"], **(sft_kwargs or {})),
+        "dpo": _build_adaptive_pipeline(tmp_path, sources["dpo"], role="dpo", **(dpo_kwargs or {})),
+    }
+    results = {}
+    for role in order:
+        ds, cache_mod, _ = loaders[role]
+        saves = _CallCounter(cache_mod, "_save_cache_index")
+        drift = _CallCounter(cache_mod, "_drift_recovery_pass")
+        augment = _CallCounter(cache_mod, "_augment_cache_with_missing_names")
+        capsys.readouterr()
+        batches = _drain(ds)
+        results[role] = {
+            "out": capsys.readouterr().out,
+            "saves": saves.count,
+            "drift": drift.count,
+            "augment": augment.count,
+            "batches": len(batches),
+            "cache": cache_mod,
+        }
+    return results
+
+
+class TestSftDpoSharedCacheScenario:
+    """The user's SFT + DPO setup: a main loader and a DPO add-on loader with
+    different role signatures share one adaptive image cache dir, and every
+    process start builds fresh instances of both."""
+
+    def test_three_starts_both_loaders_fast_and_index_untouched(self, tmp_path, capsys):
+        sources = {"sft": _adaptive_dataset(tmp_path, "sft"), "dpo": _adaptive_dataset(tmp_path, "dpo")}
+        cache_dir = str(tmp_path / "cache")
+
+        first = _shared_cache_start(tmp_path, sources, capsys)
+        assert first["sft"]["batches"] == 3 and first["dpo"]["batches"] == 3
+        stat_after_first = _index_stat(cache_dir)
+        sentinel = os.path.join(cache_dir, "blank_sentinel.pt")
+        sentinel_stat = os.stat(sentinel).st_mtime_ns
+        assert {"latent", "latent_rejected"} <= set(torch.load(sentinel, weights_only=False))
+
+        for order in (("sft", "dpo"), ("dpo", "sft")):  # starts 2 and 3
+            time.sleep(0.05)
+            result = _shared_cache_start(tmp_path, sources, capsys, order=order)
+            for role in ("sft", "dpo"):
+                run = result[role]
+                assert "Fast validation passed" in run["out"], (role, run["out"])
+                assert "adaptive variants verified" in run["out"]
+                assert run["drift"] == 0, (role, run["out"])
+                assert run["augment"] == 0
+                assert run["saves"] == 0, (role, run["out"])
+                assert run["batches"] == 3
+            assert _index_stat(cache_dir) == stat_after_first
+            assert os.stat(sentinel).st_mtime_ns == sentinel_stat
+
+    def test_edited_image_only_revalidates_its_own_role(self, tmp_path, capsys):
+        sources = {"sft": _adaptive_dataset(tmp_path, "sft"), "dpo": _adaptive_dataset(tmp_path, "dpo")}
+        cache_dir = str(tmp_path / "cache")
+        _shared_cache_start(tmp_path, sources, capsys)
+        _shared_cache_start(tmp_path, sources, capsys)
+
+        edited = os.path.normpath(sources["dpo"]["paths"][1])
+        old_hash = _read_cache_json(cache_dir)["entries"][edited]["hash"]
+        with open(edited, "wb") as f:
+            f.write(b"dpo-1 edited between starts")
+        os.utime(edited, (time.time() + 10, time.time() + 10))
+
+        third = _shared_cache_start(tmp_path, sources, capsys)
+        assert "Fast validation passed" in third["sft"]["out"]
+        assert third["sft"]["saves"] == 0 and third["sft"]["drift"] == 0
+        assert "Fast validation passed" not in third["dpo"]["out"]
+        assert "Cached 1/3" in third["dpo"]["out"]
+        assert third["dpo"]["drift"] == 0
+        assert third["dpo"]["saves"] >= 1
+        assert _read_cache_json(cache_dir)["entries"][edited]["hash"] != old_hash
+
+        stat_after_third = _index_stat(cache_dir)
+        time.sleep(0.05)
+        fourth = _shared_cache_start(tmp_path, sources, capsys, order=("dpo", "sft"))
+        for role in ("sft", "dpo"):
+            assert "Fast validation passed" in fourth[role]["out"], (role, fourth[role]["out"])
+            assert fourth[role]["saves"] == 0
+        assert _index_stat(cache_dir) == stat_after_third
+
+
+class TestIndexSaveDiscipline:
+    """cache.json is written compactly, and only when a refresh changed it."""
+
+    def _plain_pipeline(self, tmp_path, paths, tensors, **kwargs):
+        return _build_smart_pipeline(
+            tmp_path,
+            concepts=[{"name": "A", "path": "dummy"}],
+            dummy_data={"latent": tensors, "image_path": paths},
+            dummy_length=len(paths),
+            split_names=["latent"],
+            aggregate_names=[],
+            source_path_in_name="image_path",
+            dummy_module_cls=MutableDummyDataModule,
+            **kwargs,
+        )
+
+    def _files(self, tmp_path, n=3):
+        src = tmp_path / "sources"
+        paths = [_create_source_file(src, f"f{i}.bin", f"file {i}".encode()) for i in range(n)]
+        return paths, _make_tensors(n, seed=21)
+
+    def test_saved_index_is_compact_and_round_trips(self, tmp_path):
+        sources = _adaptive_dataset(tmp_path, "dpo")
+        ds, cache_mod, _ = _build_adaptive_pipeline(tmp_path, sources, role="dpo")
+        _drain(ds)
+        with open(os.path.join(cache_mod.cache_dir, "cache.json"), "rb") as f:
+            raw = f.read().decode("utf-8")
+        assert "\n" not in raw and '": ' not in raw
+        assert json.loads(raw) == json.loads(json.dumps(cache_mod.cache_index))
+
+    def test_compact_backup_is_recovered(self, tmp_path):
+        paths, tensors = self._files(tmp_path)
+        ds, cache_dir, _ = self._plain_pipeline(tmp_path, paths, tensors)
+        _drain(ds)
+        sdc = SmartDiskCache.__new__(SmartDiskCache)
+        sdc.cache_dir = cache_dir
+        sdc.cache_index = _read_cache_json(cache_dir)
+        sdc._index_lock = __import__("threading").Lock()
+        sdc._index_io_lock = __import__("threading").Lock()
+        sdc._save_cache_index()  # second save leaves the first as .bak
+        cache_json = os.path.join(cache_dir, "cache.json")
+        assert os.path.isfile(cache_json + ".bak")
+        with open(cache_json, "w") as f:
+            f.write("{corrupt")
+        loaded = sdc._load_cache_index()
+        assert set(loaded["entries"]) == {os.path.normpath(p) for p in paths}
+        assert sdc._index_dirty, "an index recovered from .bak must be re-saved"
+
+    def test_zero_arg_save_stub_survives_a_full_refresh(self, tmp_path):
+        sources = _adaptive_dataset(tmp_path, "dpo")
+        ds, cache_mod, _ = _build_adaptive_pipeline(tmp_path, sources, role="dpo")
+        cache_mod._save_cache_index = lambda: None
+        assert len(_drain(ds)) == 3
+
+    def test_gc_clean_and_atomic_write_are_compact(self, tmp_path):
+        paths, tensors = self._files(tmp_path)
+        ds, cache_dir, _ = self._plain_pipeline(tmp_path, paths, tensors)
+        _drain(ds)
+        before = _read_cache_json(cache_dir)
+        SmartDiskCache.gc_clean(cache_dir)
+        with open(os.path.join(cache_dir, "cache.json"), encoding="utf-8") as f:
+            raw = f.read()
+        assert "\n" not in raw
+        assert json.loads(raw)["entries"] == before["entries"]
+
+        target = os.path.join(str(tmp_path), "aux.json")
+        payload = {"version": 1, "entries": {"a": "b", "c": [1, 2]}}
+        SmartDiskCache._atomic_write_json(target, payload)
+        with open(target, encoding="utf-8") as f:
+            raw = f.read()
+        assert "\n" not in raw and json.loads(raw) == payload
+
+    def test_clean_non_adaptive_fast_path_and_touch_free_restart_do_not_save(self, tmp_path, capsys):
+        paths, tensors = self._files(tmp_path)
+        ds1, cache_dir, _ = self._plain_pipeline(tmp_path, paths, tensors)
+        _drain(ds1)
+        stat_before = _index_stat(cache_dir)
+        time.sleep(0.05)
+        ds2, _, _ = self._plain_pipeline(tmp_path, paths, tensors)
+        _drain(ds2)
+        assert "Fast validation passed" in capsys.readouterr().out
+        assert _index_stat(cache_dir) == stat_before
+
+    def test_new_file_build_is_saved(self, tmp_path, monkeypatch):
+        paths, tensors = self._files(tmp_path)
+        ds1, cache_dir, _ = self._plain_pipeline(tmp_path, paths, tensors)
+        _drain(ds1)
+        # Trust mode: no validation token is re-stamped, so the only reason
+        # left to save is the build itself.
+        monkeypatch.setenv("OT_SKIP_CACHE_VALIDATION", "1")
+        new_path = _create_source_file(tmp_path / "sources", "new.bin", b"new file")
+        ds2, _, _ = self._plain_pipeline(tmp_path, paths + [new_path], tensors + _make_tensors(1, seed=99))
+        cache2 = next(m for m in ds2.loading_pipeline.modules if isinstance(m, SmartDiskCache))
+        saves = _CallCounter(cache2, "_save_cache_index")
+        _drain(ds2)
+        assert saves.count >= 1
+        assert os.path.normpath(new_path) in _read_cache_json(cache_dir)["entries"]
+
+    def test_content_change_delete_and_rebuild_is_saved(self, tmp_path):
+        paths, tensors = self._files(tmp_path)
+        ds1, cache_dir, _ = self._plain_pipeline(tmp_path, paths, tensors)
+        _drain(ds1)
+        fp = os.path.normpath(paths[0])
+        old_hash = _read_cache_json(cache_dir)["entries"][fp]["hash"]
+        with open(paths[0], "wb") as f:
+            f.write(b"different bytes")
+        os.utime(paths[0], (time.time() + 10, time.time() + 10))
+
+        ds2, _, _ = self._plain_pipeline(tmp_path, paths, tensors)
+        _drain(ds2)
+        assert _read_cache_json(cache_dir)["entries"][fp]["hash"] != old_hash
+
+    def test_build_failure_is_saved_in_trust_mode(self, tmp_path, monkeypatch):
+        paths, tensors = self._files(tmp_path)
+        ds1, cache_dir, _ = self._plain_pipeline(tmp_path, paths, tensors)
+        _drain(ds1)
+        roles_before = _read_cache_json(cache_dir)["roles"]
+
+        monkeypatch.setenv("OT_SKIP_CACHE_VALIDATION", "1")
+        new_path = _create_source_file(tmp_path / "sources", "broken.bin", b"broken")
+        ds2, _, _ = self._plain_pipeline(tmp_path, paths + [new_path], tensors + _make_tensors(1, seed=5))
+        cache2 = next(m for m in ds2.loading_pipeline.modules if isinstance(m, SmartDiskCache))
+
+        def failing_build(*args, **kwargs):
+            raise RuntimeError("encode failed")
+
+        cache2._build_cache_entry = failing_build
+        saves = _CallCounter(cache2, "_save_cache_index")
+        _drain(ds2)
+
+        assert saves.count >= 1, "a refresh with a failed build must still save"
+        assert _read_cache_json(cache_dir)["roles"] == roles_before
+
+    def test_mtime_only_touch_refresh_is_saved(self, tmp_path):
+        paths, tensors = self._files(tmp_path)
+        ds1, cache_dir, _ = self._plain_pipeline(tmp_path, paths, tensors)
+        _drain(ds1)
+        touched = time.time() + 30
+        os.utime(paths[0], (touched, touched))
+
+        ds2, _, _ = self._plain_pipeline(tmp_path, paths, tensors)
+        _drain(ds2)
+        assert _read_cache_json(cache_dir)["entries"][os.path.normpath(paths[0])]["mtime"] == pytest.approx(touched)
+
+    def test_sentinel_rewrite_does_not_resave_index(self, tmp_path):
+        sources = _adaptive_dataset(tmp_path, "sft")
+        ds1, cache1, _ = _build_adaptive_pipeline(tmp_path, sources)
+        _drain(ds1)
+        sentinel = os.path.join(cache1.cache_dir, "blank_sentinel.pt")
+        torch.save({"__modeltype": "testmodel"}, sentinel)  # stale: lacks every name
+        stat_before = _index_stat(cache1.cache_dir)
+        time.sleep(0.05)
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources)
+        saves = _CallCounter(cache2, "_save_cache_index")
+        _drain(ds2)
+
+        assert "latent" in torch.load(sentinel, weights_only=False)
+        assert saves.count == 0
+        assert _index_stat(cache2.cache_dir) == stat_before

@@ -13,6 +13,13 @@ from collections.abc import Callable
 from typing import Any
 
 from mgds.PipelineModule import PipelineModule
+from mgds.pipelineModules.ResolutionPolicy import (
+    ADAPTIVE_MIN_RESOLUTION,
+    nominal_resolution_for_crop,
+    parse_adaptive_resolution_ladder,
+    scale_resolution_for_crop,
+    target_resolutions_for_spec,
+)
 from mgds.pipelineModuleTypes.SingleVariationRandomAccessPipelineModule import SingleVariationRandomAccessPipelineModule
 
 import torch
@@ -25,6 +32,15 @@ CACHE_VERSION = 3
 # Bumped whenever ``_augment_cache_with_missing_names`` changes behaviorally so
 # caches stamped by an older version get re-augmented on the new path.
 SCHEMA_METHOD = "shape_v1"
+
+# Several SmartDiskCache instances with different configurations can share one
+# cache dir (the SFT and DPO loaders of an SFT + DPO run both use cache/image).
+# Each configuration ("role") keeps its own bucket/schema stamps and validation
+# tokens under ``cache_index['roles'][<signature>]`` so the instances stop
+# invalidating each other; the legacy top-level stamps are still mirrored for
+# older readers. Both tables are capped, evicting the least recently changed.
+MAX_ROLE_STAMPS = 8
+MAX_ROLE_VALIDATION_TOKENS = 8
 
 # Sentinel resolution key used for sourceless / text-style entries that have
 # no resolution dimension. Lives inside ``entry['variants']`` like any other
@@ -81,6 +97,10 @@ class SmartDiskCache(
         trust_cache: bool = False,
         content_key_in_name: str | None = None,
         build_max_workers: int | None = None,
+        adaptive_resolution: bool = False,
+        additional_resolution_in_names: list[str] | None = None,
+        adaptive_resolution_max: int | None = None,
+        adaptive_resolution_ladder: str | list[int] | None = None,
     ):
         super().__init__()
         self.cache_dir = cache_dir
@@ -140,6 +160,10 @@ class SmartDiskCache(
         # multi-variant builds without re-decoding images. None for text
         # caches and any pipeline without aspect bucketing.
         self.aspect_bucketing = aspect_bucketing
+        self.adaptive_resolution = adaptive_resolution
+        self.additional_resolution_in_names = additional_resolution_in_names or []
+        self.adaptive_resolution_max = adaptive_resolution_max
+        self.adaptive_resolution_ladder = adaptive_resolution_ladder
 
         # Content-addressed reuse: name of an upstream item (e.g. the final
         # post-augmentation ``prompt`` string) whose value uniquely determines
@@ -224,6 +248,9 @@ class SmartDiskCache(
         # in-memory index is current and the per-epoch reload can be skipped.
         self._index_disk_stat = None
         self._last_flush_time = 0.0
+        # Seconds between periodic index checkpoints. Adaptive: see
+        # _flush_cache_index.
+        self._flush_interval = 120.0
         self._source_path_cache = {}
         self._aggregate_cache = {}
         # Source filepaths whose cache entries have already been validated in
@@ -254,6 +281,17 @@ class SmartDiskCache(
         # text caches (no resolution dimension) — those callers fall back to
         # _any_variant_cache_file. Reset at the top of __refresh_cache.
         self._active_key_by_filepath: dict[str, str] = {}
+        # True once the current refresh changed the in-memory index in a way
+        # that has to reach disk. Gates the end-of-refresh save, so a refresh
+        # that changed nothing neither rewrites a multi-hundred-MB cache.json
+        # nor forces every other instance sharing the dir into a full re-parse.
+        # Sticky for the whole refresh (a mid-build flush doesn't clear it);
+        # reset at the top of __refresh_cache. Set it whenever in doubt.
+        self._index_dirty = False
+        # (out_variation, {in_index: resolution}) proven by the adaptive
+        # fast-path guard and reused by _load_aggregate_cache in the same
+        # refresh instead of re-resolving every row. Reset each refresh.
+        self._epoch_keys: tuple[int, dict[int, str]] | None = None
 
     @staticmethod
     def _normpath(path: Any) -> str:
@@ -288,13 +326,27 @@ class SmartDiskCache(
         if self.variations_group_in_names:
             group_values = [self._safe_previous_item(0, name, in_index) for name in self.variations_group_in_names]
 
+        # Store the derived key, not the values. Every consumer of the old
+        # ``group_values`` field immediately reduced it to
+        # ``__string_key(group_values)`` and compared that for equality —
+        # nothing ever read the values back. Keeping the raw list meant
+        # embedding a full copy of every variations-group input (for text
+        # caches that includes the concept's ``text`` config block, which
+        # carries the tag-dropout whitelist) into the entry-level
+        # ``sourceless`` block AND again into every ``sourceless_rows``
+        # row. At ~14 KB per copy across ~96k entries that was ~2.4 GB of
+        # the index — and the whole index is re-serialized under
+        # ``_index_lock`` on every periodic flush, freezing all build
+        # workers. The sha256 is 64 bytes and preserves the key exactly.
+        group_key = self.__string_key(group_values)
+
         return {
             "source_path_in_name": self.source_path_in_name,
             "source_index": int(in_index),
             "variations": int(variations or 1),
             "balancing": self._safe_previous_item(0, self.balancing_in_name, in_index),
             "balancing_strategy": self._safe_previous_item(0, self.balancing_strategy_in_name, in_index),
-            "group_values": group_values,
+            "group_key": group_key,
             "group_enabled": self._safe_previous_item(0, self.group_enabled_in_name, in_index)
             if self.group_enabled_in_name
             else True,
@@ -386,10 +438,7 @@ class SmartDiskCache(
             if not enabled:
                 continue
 
-            group_values = meta.get("group_values")
-            if group_values is None:
-                group_values = [""]
-            group_key = self.__string_key(group_values)
+            group_key = self._metadata_group_key(meta)
             variations = int(
                 meta.get("variations")
                 or self._entry_variation_count(self.cache_index["entries"][record["filepath"]])
@@ -471,6 +520,26 @@ class SmartDiskCache(
         json_data = json.dumps(data, sort_keys=True, ensure_ascii=True, separators=(",", ":"), indent=None)
         return hashlib.sha256(json_data.encode("utf-8")).hexdigest()
 
+    def _metadata_group_key(self, meta: Any) -> str:
+        """Variations-group key of a stamped sourceless metadata block.
+
+        Current stamps carry the derived key directly. Caches written before
+        that change carry the raw ``group_values`` list instead, so the key is
+        recomputed from it — including the historical "missing key means
+        ``[""]``" default, so a legacy stamp keeps hashing to the same key it
+        always did. An empty list is NOT the same as a missing field and is
+        hashed as-is, matching the old read path.
+        """
+        if not isinstance(meta, dict):
+            meta = {}
+        group_key = meta.get("group_key")
+        if isinstance(group_key, str):
+            return group_key
+        group_values = meta.get("group_values")
+        if group_values is None:
+            group_values = [""]
+        return self.__string_key(group_values)
+
     def _hash_file(self, filepath: str) -> str:
         h = xxhash.xxh64()
         with open(filepath, "rb") as f:
@@ -496,8 +565,7 @@ class SmartDiskCache(
                 for p in (tmp_path, bak_path):
                     with contextlib.suppress(OSError):
                         os.remove(p)
-                self._migrate_legacy_index_in_place(data)
-                self._migrate_intern_sourceless_concepts(data)
+                self._migrate_loaded_index(data)
                 return data
             except (json.JSONDecodeError, OSError):
                 pass
@@ -507,8 +575,7 @@ class SmartDiskCache(
                 with open(tmp_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 os.replace(tmp_path, cache_path)
-                self._migrate_legacy_index_in_place(data)
-                self._migrate_intern_sourceless_concepts(data)
+                self._migrate_loaded_index(data, recovered=True)
                 return data
             except (json.JSONDecodeError, OSError):
                 pass
@@ -518,13 +585,24 @@ class SmartDiskCache(
                 with open(bak_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 os.replace(bak_path, cache_path)
-                self._migrate_legacy_index_in_place(data)
-                self._migrate_intern_sourceless_concepts(data)
+                self._migrate_loaded_index(data, recovered=True)
                 return data
             except (json.JSONDecodeError, OSError):
                 pass
 
         return {"version": CACHE_VERSION, "entries": {}, "hash_index": {}}
+
+    def _migrate_loaded_index(self, data: dict, recovered: bool = False) -> None:
+        """Run the on-load migrations; anything they changed must be saved.
+
+        ``recovered`` marks an index restored from .tmp/.bak, which is also
+        persisted by the next save rather than trusted to stay in place.
+        """
+        legacy = data.get("version", 0) < CACHE_VERSION
+        self._migrate_legacy_index_in_place(data)
+        interned = self._migrate_intern_sourceless_concepts(data)
+        if legacy or interned or recovered:
+            self._index_dirty = True
 
     @staticmethod
     def _migrate_legacy_index_in_place(idx: dict) -> None:
@@ -567,7 +645,7 @@ class SmartDiskCache(
         loaded or saved (external writer, e.g. gc_clean from another run)."""
         return self._snapshot_index_stat() != self._index_disk_stat
 
-    def _save_cache_index(self, compact: bool = False, backup: bool = True):
+    def _save_cache_index(self, compact: bool = True, backup: bool = True):
         os.makedirs(self.cache_dir, exist_ok=True)
         cache_path = self._get_cache_json_path()
         tmp_path = cache_path + ".tmp"
@@ -578,7 +656,13 @@ class SmartDiskCache(
         # builder thread that needed to register an entry while the periodic
         # flush was writing a multi-MB index to disk.
         with self._index_lock:
-            payload = json.dumps(self.cache_index, indent=None if compact else 2)
+            if compact:
+                # cache.json is machine-only (every reader uses json.load).
+                # ``indent`` also forces the pure-Python encoder instead of the
+                # C one, which profiled ~6x slower on a large index.
+                payload = json.dumps(self.cache_index, separators=(",", ":"))
+            else:
+                payload = json.dumps(self.cache_index, indent=2)
 
         with self._index_io_lock:
             # Write bytes directly: a text-mode write on Windows funnels the
@@ -599,11 +683,31 @@ class SmartDiskCache(
             self._index_disk_stat = self._snapshot_index_stat()
 
     def _flush_cache_index(self):
+        """Periodic crash-recovery checkpoint of the index.
+
+        Spacing adapts to what a checkpoint actually costs. ``json.dumps``
+        runs under ``_index_lock``, so for its whole duration every build
+        worker blocks on ``_try_dedup``/``_build_cache_entry`` *and* the
+        drain loop that owns the progress bar is stuck here — the build
+        goes completely silent. On a large index that dumps takes tens of
+        seconds, so a fixed 120s cadence spent a double-digit percentage of
+        the run frozen. Targeting 5% keeps the checkpoint cheap on any index
+        size; the end-of-build ``_save_cache_index`` is what guarantees
+        durability, this only bounds how much progress a crash can lose.
+        """
         now = time.monotonic()
-        if now - self._last_flush_time >= 120.0:
-            self._save_cache_index(compact=True, backup=False)
-            self._save_content_index()
-            self._last_flush_time = now
+        if now - self._last_flush_time < self._flush_interval:
+            return
+
+        started = time.monotonic()
+        self._save_cache_index(compact=True, backup=False)
+        self._save_content_index()
+        elapsed = time.monotonic() - started
+
+        self._flush_interval = max(120.0, 20.0 * elapsed)
+        # Measured from completion, not entry: a checkpoint that itself took
+        # longer than the interval would otherwise re-fire immediately.
+        self._last_flush_time = time.monotonic()
 
     # ------------------------------------------------------------------
     # Content-addressed reuse (content_key_in_name)
@@ -850,6 +954,187 @@ class SmartDiskCache(
         except Exception:
             return None
 
+    def _role_signature(self) -> str:
+        """Identity of this instance's cache configuration.
+
+        Instances sharing one cache dir with different schemas, resolution
+        inputs or watched sidecars (the SFT and DPO loaders of one run) used to
+        overwrite each other's single top-level stamps, so every refresh saw
+        bucket and schema drift from the other loader. Stamps are kept per
+        signature instead. Variations-group inputs are left out: they never
+        change .pt content, and validation tokens are additionally keyed by
+        the dataset digest.
+        """
+        payload = {
+            "schema": sorted(set(self.split_names) | set(self.aggregate_names)),
+            "additional_resolutions": list(getattr(self, "additional_resolution_in_names", None) or []),
+            "watched": sorted(getattr(self, "extra_watched_paths_in_names", None) or []),
+            "source": self.source_path_in_name,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:16]
+
+    @staticmethod
+    def _dataset_digest(filepaths) -> str:
+        """Order-independent digest of the source paths a refresh delivers.
+
+        Validation tokens are keyed by it so two loaders with one role but
+        different datasets (e.g. the training and validation loaders) each
+        keep a token whose fingerprint covers exactly their own rows.
+        """
+        h = hashlib.sha256()
+        for filepath in sorted(filepaths):
+            h.update(filepath.encode("utf-8", "surrogatepass"))
+            h.update(b"\0")
+        return h.hexdigest()[:16]
+
+    def _role_block(self, role_sig: str) -> dict | None:
+        roles = self.cache_index.get("roles")
+        if not isinstance(roles, dict):
+            return None
+        role = roles.get(role_sig)
+        return role if isinstance(role, dict) else None
+
+    def _role_stamps(self, role_sig: str) -> dict:
+        """bucket_method / schema / schema_method as last stamped for this role.
+
+        Migration: an index without a ``roles`` table (written before per-role
+        stamps, or by an older mgds) and a role missing from the table both
+        seed from the legacy top-level stamps. That is exactly the pre-role
+        behaviour, so at worst one drift/validation pass stamps the role.
+        """
+        role = self._role_block(role_sig)
+        source = role if role is not None else self.cache_index
+        return {name: source.get(name) for name in ("bucket_method", "schema", "schema_method")}
+
+    def _role_validation_token(self, role_sig: str, digest: str) -> dict | None:
+        """The fast-validation token this role + dataset may rely on, or None."""
+        role = self._role_block(role_sig)
+        if role is not None:
+            token = (role.get("validations") or {}).get(digest)
+            if isinstance(token, dict):
+                return dict(token, scope="required")
+            return None
+        if isinstance(self.cache_index.get("roles"), dict):
+            # The table exists but this role never validated: a token another
+            # configuration wrote can't vouch for this one's rows.
+            return None
+        # Pre-role index: the legacy global token, checked over every entry
+        # exactly as before.
+        return {
+            "last_validated": self.cache_index.get("last_validated"),
+            "watched_fingerprints": self.cache_index.get("watched_fingerprints"),
+            "scope": "all",
+        }
+
+    def _ensure_role_block(self, role_sig: str) -> dict:
+        roles = self.cache_index.get("roles")
+        if not isinstance(roles, dict):
+            roles = {}
+            self.cache_index["roles"] = roles
+        role = roles.get(role_sig)
+        if not isinstance(role, dict):
+            role = {}
+            roles[role_sig] = role
+        return role
+
+    def _prune_roles(self, keep_sig: str) -> None:
+        roles = self.cache_index.get("roles")
+        if not isinstance(roles, dict) or len(roles) <= MAX_ROLE_STAMPS:
+            return
+
+        def updated(sig: str) -> float:
+            role = roles.get(sig)
+            return (role.get("updated") or 0.0) if isinstance(role, dict) else 0.0
+
+        stale = sorted((sig for sig in roles if sig != keep_sig), key=updated)
+        for sig in stale[: len(roles) - MAX_ROLE_STAMPS]:
+            del roles[sig]
+
+    def _stamp_role(self, role_sig: str, **stamps) -> bool:
+        """Record this role's stamps; True when anything persisted changed.
+
+        The same values are mirrored to the legacy top-level keys so an older
+        mgds reading this index still finds (the most recent role's) stamps.
+        """
+        with self._index_lock:
+            changed = self._role_block(role_sig) is None
+            role = self._ensure_role_block(role_sig)
+            for name, value in stamps.items():
+                if role.get(name) != value:
+                    role[name] = value
+                    changed = True
+                self.cache_index[name] = value
+            if changed:
+                role["updated"] = time.time()
+                self._prune_roles(role_sig)
+        return changed
+
+    def _pop_role_validation(self, role_sig: str, digest: str) -> dict | None:
+        role = self._role_block(role_sig)
+        validations = role.get("validations") if role is not None else None
+        if not isinstance(validations, dict):
+            return None
+        token = validations.pop(digest, None)
+        return token if isinstance(token, dict) else None
+
+    def _stamp_role_validation(self, role_sig: str, digest: str, token: dict) -> None:
+        with self._index_lock:
+            role = self._ensure_role_block(role_sig)
+            validations = role.get("validations")
+            if not isinstance(validations, dict):
+                validations = {}
+                role["validations"] = validations
+            validations[digest] = token
+            if len(validations) > MAX_ROLE_VALIDATION_TOKENS:
+
+                def validated_at(key: str) -> float:
+                    value = validations.get(key)
+                    return (value.get("last_validated") or 0.0) if isinstance(value, dict) else 0.0
+
+                stale = sorted((key for key in validations if key != digest), key=validated_at)
+                for key in stale[: len(validations) - MAX_ROLE_VALIDATION_TOKENS]:
+                    del validations[key]
+            # Legacy mirror for older readers. Their global fingerprint won't
+            # match this scoped one unless the scopes coincide, which only
+            # costs them a full validation.
+            self.cache_index["last_validated"] = token.get("last_validated")
+            self.cache_index["watched_fingerprints"] = token.get("watched_fingerprints")
+
+    @staticmethod
+    def _same_fingerprints(stored, current) -> bool:
+        if not isinstance(stored, dict) or not isinstance(current, dict):
+            return False
+        try:
+            return {k: tuple(v) for k, v in stored.items()} == {k: tuple(v) for k, v in current.items()}
+        except TypeError:
+            return False
+
+    def _missing_schema_names(self, filepaths) -> set[str]:
+        """Required names absent from any recorded variant schema of ``filepaths``.
+
+        Another role sharing the cache dir can rebuild a shared file's variant
+        with its narrower schema. Checked from the index ``schema_keys`` only
+        (no .pt reads); variants without a recorded schema are left to
+        ``_validate_entry``'s one-time peek.
+        """
+        required = set(self.split_names) | set(self.aggregate_names)
+        if not required:
+            return set()
+        entries = self.cache_index.get("entries", {})
+        missing: set[str] = set()
+        for filepath in filepaths:
+            entry = entries.get(filepath)
+            if not isinstance(entry, dict) or entry.get("modeltype") != self.modeltype:
+                continue
+            for variant in (entry.get("variants") or {}).values():
+                schema_keys = variant.get("schema_keys")
+                if schema_keys is None or not variant.get("cache_file"):
+                    continue
+                if not required.issubset(schema_keys):
+                    missing.update(required.difference(schema_keys))
+        return missing
+
     def _populate_active_keys(self, filepaths) -> None:
         """Set this session's active variant key per filepath to the first
         registered variant. Used by the session-skip and fast-validate paths
@@ -907,6 +1192,103 @@ class SmartDiskCache(
                     continue
                 required.add((filepath, self._resolution_key(resolution)))
         return required, resolvable
+
+    @staticmethod
+    def _resolution_stamp_token(entry: dict) -> tuple:
+        """The entry fields ``_fast_resolution_string`` may stamp.
+
+        It replaces (never mutates in place) ``original_resolution`` and
+        ``source_resolutions``, so holding the previous objects and comparing
+        by value detects every stamp it wrote.
+        """
+        return (
+            entry.get("adaptive_resolution_applied"),
+            entry.get("adaptive_max_resolution"),
+            entry.get("original_resolution"),
+            entry.get("source_resolutions"),
+        )
+
+    def _epoch_key(self, out_variation: int, in_index: int) -> str | None:
+        epoch_keys = getattr(self, "_epoch_keys", None)
+        if epoch_keys is None or epoch_keys[0] != out_variation:
+            return None
+        return epoch_keys[1].get(in_index)
+
+    def _adaptive_fast_path_guard(self, index_to_filepath, out_variation):
+        """Prove this epoch's adaptive variants exist before skipping validation.
+
+        ``_fast_validate`` only spot-checks that *some* variant of a sampled
+        entry has a ``_1.pt``. Under adaptive resolution an entry can hold
+        several tiers, and when the tier a row needs is missing, get_item
+        silently falls back to a different tier or the blank sentinel. The
+        adaptive fast path therefore also requires, for every row:
+
+        * the source resolutions its key depends on are already stamped (never
+          reads upstream: an unstamped row needs full validation);
+        * the resolved variant has a cache_file, every variation's .pt is in
+          ``_existing_pt_files``, and its ``schema_keys`` cover this cache;
+        * no watched sidecar the row now resolves to exists unrecorded.
+
+        Returns ``((keys, pairs, stamps_changed), None)`` on success, where
+        ``keys`` maps in_index to its resolution string and ``pairs`` holds the
+        (filepath, key) set; ``(None, reason)`` on the first failure.
+        """
+        entries = self.cache_index.get("entries", {})
+        required_names = set(self.split_names) | set(self.aggregate_names)
+        additional_names = list(getattr(self, "additional_resolution_in_names", None) or [])
+        keys: dict[int, str] = {}
+        pairs: set[tuple[str, str]] = set()
+        stamps_changed = False
+        for group_key in self.group_variations:
+            variations = self.group_variations[group_key]
+            for in_index in self.group_indices[group_key]:
+                filepath = index_to_filepath.get(in_index)
+                if filepath is None:
+                    continue
+                entry = entries.get(filepath)
+                if entry is None:
+                    return None, f"{filepath} is not indexed"
+                if entry.get("modeltype") != self.modeltype:
+                    return None, f"{filepath} was cached for another model type"
+                # Mirror _fast_resolution_string's lookups exactly, so a row it
+                # would resolve by walking upstream is rejected here instead.
+                source_map = entry.get("source_resolutions") or {}
+                resolution_values = [source_map.get("original_resolution", entry.get("original_resolution"))]
+                resolution_values.extend(source_map.get(name) for name in additional_names)
+                for value in resolution_values:
+                    try:
+                        stamped = isinstance(value, (list, tuple)) and len(value) >= 2 and float(value[-1]) > 0
+                    except (TypeError, ValueError):
+                        stamped = False
+                    if not stamped:
+                        return None, f"{filepath} has unstamped source resolutions"
+                stored_sidecars = entry.get("sidecar_mtimes") or {}
+                for sidecar in (self._extra_paths_by_filepath.get(filepath) or {}).values():
+                    if sidecar not in stored_sidecars and os.path.exists(sidecar):
+                        return None, f"{filepath} has an unrecorded sidecar"
+                before = self._resolution_stamp_token(entry)
+                resolution = self._fast_resolution_string(entry, out_variation, in_index)
+                if self._resolution_stamp_token(entry) != before:
+                    # Persisted by whichever path runs next: the fast path
+                    # saves on success, full validation's end save on decline.
+                    stamps_changed = True
+                    self._index_dirty = True
+                if resolution is None:
+                    return None, f"{filepath} has no resolvable variant key"
+                key = self._resolution_key(resolution)
+                variant = (entry.get("variants") or {}).get(key)
+                cache_file = variant.get("cache_file") if isinstance(variant, dict) else None
+                if not cache_file:
+                    return None, f"{filepath} is missing variant {key}"
+                for v in range(variations):
+                    if f"{cache_file}_{v + 1}.pt" not in self._existing_pt_files:
+                        return None, f"{filepath} variant {key} is missing {cache_file}_{v + 1}.pt"
+                schema_keys = variant.get("schema_keys")
+                if required_names and (schema_keys is None or not required_names.issubset(schema_keys)):
+                    return None, f"{filepath} variant {key} has an incomplete recorded schema"
+                keys[in_index] = resolution
+                pairs.add((filepath, key))
+        return (keys, pairs, stamps_changed), None
 
     def _drift_recovery_pass(self) -> None:
         """Re-derive variant keys from cached aspects when bucket config drifted.
@@ -1156,6 +1538,7 @@ class SmartDiskCache(
             return "content_changed"
 
         entry["mtime"] = current_mtime
+        self._index_dirty = True
 
         if not self._check_sidecars(filepath, entry):
             return "content_changed"
@@ -1196,6 +1579,7 @@ class SmartDiskCache(
         present = sorted(k for k in data if not k.startswith("__"))
         with self._index_lock:
             variant["schema_keys"] = present
+        self._index_dirty = True
         return required.issubset(present)
 
     def _detect_cache_schema_drift(self) -> set[str]:
@@ -1246,20 +1630,271 @@ class SmartDiskCache(
                 return cache_file
         return None
 
+    @staticmethod
+    def _atomic_write_json(path: str, payload: dict) -> None:
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+
+    @classmethod
+    def _adaptive_prune_plan(
+        cls,
+        cache_dir: str,
+        additional_resolution_names: list[str] | None = None,
+        additional_resolution_provider: Callable[[str, dict], dict[str, list[int]] | None] | None = None,
+        adaptive_resolution_ladder: str | list[int] | None = None,
+        adaptive_resolution_max: int | None = None,
+    ) -> tuple[dict, dict, dict]:
+        """Build a read-only plan for removing cache variants that upscale.
+
+        Only index metadata and file headers supplied by the optional caller
+        are consulted; tensor payloads are never loaded.
+        """
+        index_path = os.path.join(cache_dir, "cache.json")
+        with open(index_path, "r", encoding="utf-8") as handle:
+            original_index = json.load(handle)
+        updated_index = copy.deepcopy(original_index)
+        additional_resolution_names = additional_resolution_names or []
+
+        affected_paths = []
+        removed_variants = []
+        skipped_paths = []
+        entries_without_usable_variant = []
+
+        for filepath, entry in (updated_index.get("entries") or {}).items():
+            if entry.get("adaptive_resolution_applied") is False:
+                continue
+            source_map = dict(entry.get("source_resolutions") or {})
+            if "original_resolution" not in source_map and entry.get("original_resolution") is not None:
+                source_map["original_resolution"] = entry["original_resolution"]
+            missing_names = [
+                name
+                for name in ["original_resolution", *additional_resolution_names]
+                if not isinstance(source_map.get(name), (list, tuple)) or len(source_map[name]) < 2
+            ]
+            if missing_names and additional_resolution_provider is not None:
+                resolved = additional_resolution_provider(filepath, entry) or {}
+                source_map.update(resolved)
+                missing_names = [
+                    name
+                    for name in ["original_resolution", *additional_resolution_names]
+                    if not isinstance(source_map.get(name), (list, tuple)) or len(source_map[name]) < 2
+                ]
+            if missing_names:
+                skipped_paths.append({"filepath": filepath, "missing": missing_names})
+                continue
+
+            primary = source_map["original_resolution"]
+            all_sources = [
+                source_map["original_resolution"],
+                *(source_map[name] for name in additional_resolution_names),
+            ]
+            variants = entry.get("variants") or {}
+            remove_keys = []
+            missing_variant_metadata = []
+            entry_maximum = entry.get("adaptive_max_resolution", adaptive_resolution_max)
+            try:
+                if entry_maximum is None:
+                    adaptive_floor = min(parse_adaptive_resolution_ladder(adaptive_resolution_ladder))
+                else:
+                    adaptive_floor = min(
+                        target_resolutions_for_spec(
+                            str(entry_maximum),
+                            True,
+                            adaptive_resolution_ladder,
+                        )
+                    )
+            except (TypeError, ValueError):
+                adaptive_floor = ADAPTIVE_MIN_RESOLUTION
+            for key, variant in variants.items():
+                crop = variant.get("crop_resolution")
+                if not isinstance(crop, (list, tuple)) or len(crop) < 2:
+                    parts = key.split("x")
+                    crop = parts if len(parts) == 2 else None
+                if crop is None:
+                    missing_variant_metadata.append(f"crop_resolution:{key}")
+                    continue
+                try:
+                    crop_h, crop_w = int(crop[-2]), int(crop[-1])
+                except (TypeError, ValueError):
+                    missing_variant_metadata.append(f"crop_resolution:{key}")
+                    continue
+                if crop_h <= 0 or crop_w <= 0:
+                    missing_variant_metadata.append(f"crop_resolution:{key}")
+                    continue
+                # The smallest configured tier is an intentional training
+                # floor: retain it even when the source must be enlarged once.
+                if (
+                    variant.get("target_resolution") == adaptive_floor
+                    or nominal_resolution_for_crop((crop_h, crop_w)) <= adaptive_floor + 1
+                ):
+                    continue
+                scale_h, scale_w = scale_resolution_for_crop(primary, (crop_h, crop_w))
+                if any(int(source[-2]) < scale_h or int(source[-1]) < scale_w for source in all_sources):
+                    remove_keys.append(key)
+
+            if missing_variant_metadata:
+                skipped_paths.append({"filepath": filepath, "missing": missing_variant_metadata})
+
+            if not remove_keys:
+                continue
+            affected_paths.append(filepath)
+            for key in remove_keys:
+                record = variants.pop(key)
+                removed_variants.append(
+                    {
+                        "filepath": filepath,
+                        "variant": key,
+                        "cache_file": record.get("cache_file"),
+                    }
+                )
+            if not any(value.get("cache_file") for value in variants.values()):
+                entries_without_usable_variant.append(filepath)
+
+        retained_cache_files = {
+            variant.get("cache_file")
+            for entry in (updated_index.get("entries") or {}).values()
+            for variant in (entry.get("variants") or {}).values()
+            if variant.get("cache_file")
+        }
+        removed_cache_files = {
+            item["cache_file"]
+            for item in removed_variants
+            if item.get("cache_file") and item["cache_file"] not in retained_cache_files
+        }
+        files = []
+        if os.path.isdir(cache_dir):
+            for item in os.scandir(cache_dir):
+                if not item.is_file() or not item.name.endswith(".pt"):
+                    continue
+                cache_file = item.name.rsplit("_", 1)[0]
+                if cache_file in removed_cache_files:
+                    files.append(
+                        {
+                            "path": item.path,
+                            "name": item.name,
+                            "bytes": item.stat().st_size,
+                        }
+                    )
+
+        result = {
+            "affected_entries": len(affected_paths),
+            "affected_entry_paths": affected_paths,
+            "removed_variants": len(removed_variants),
+            "variant_records": removed_variants,
+            "files": len(files),
+            "file_records": files,
+            "bytes": sum(item["bytes"] for item in files),
+            "skipped_missing_metadata": len(skipped_paths),
+            "skipped_entries": skipped_paths,
+            "entries_without_usable_variant": len(entries_without_usable_variant),
+            "entries_without_usable_variant_paths": entries_without_usable_variant,
+        }
+        return original_index, updated_index, result
+
+    @classmethod
+    def preview_adaptive_prune(
+        cls,
+        cache_dir: str,
+        additional_resolution_names: list[str] | None = None,
+        additional_resolution_provider: Callable[[str, dict], dict[str, list[int]] | None] | None = None,
+        adaptive_resolution_ladder: str | list[int] | None = None,
+        adaptive_resolution_max: int | None = None,
+    ) -> dict:
+        _, _, result = cls._adaptive_prune_plan(
+            cache_dir,
+            additional_resolution_names,
+            additional_resolution_provider,
+            adaptive_resolution_ladder,
+            adaptive_resolution_max,
+        )
+        return result
+
+    @classmethod
+    def clean_adaptive_prune(
+        cls,
+        cache_dir: str,
+        additional_resolution_names: list[str] | None = None,
+        additional_resolution_provider: Callable[[str, dict], dict[str, list[int]] | None] | None = None,
+        adaptive_resolution_ladder: str | list[int] | None = None,
+        adaptive_resolution_max: int | None = None,
+    ) -> dict:
+        _, updated_index, result = cls._adaptive_prune_plan(
+            cache_dir,
+            additional_resolution_names,
+            additional_resolution_provider,
+            adaptive_resolution_ladder,
+            adaptive_resolution_max,
+        )
+        index_path = os.path.join(cache_dir, "cache.json")
+
+        # Remove records first. If deletion is interrupted, the remaining .pt
+        # files are harmless orphans and can be reclaimed on the next run.
+        cls._atomic_write_json(index_path, updated_index)
+
+        deleted_files = 0
+        delete_errors = []
+        deleted_cache_files = set()
+        for file_record in result["file_records"]:
+            try:
+                os.remove(file_record["path"])
+                deleted_files += 1
+                name = file_record["name"]
+                deleted_cache_files.add(name.rsplit("_", 1)[0])
+            except OSError as exc:  # noqa: PERF203 - continue deleting independent files
+                delete_errors.append({"path": file_record["path"], "error": str(exc)})
+
+        content_index_path = os.path.join(cache_dir, "content_index.json")
+        if deleted_cache_files and os.path.isfile(content_index_path):
+            try:
+                with open(content_index_path, "r", encoding="utf-8") as handle:
+                    content_index = json.load(handle)
+                entries = content_index.get("entries") or {}
+
+                def references_deleted_file(value) -> bool:
+                    return isinstance(value, str) and any(
+                        value == cache_file or value.startswith(f"{cache_file}_") for cache_file in deleted_cache_files
+                    )
+
+                content_index["entries"] = {
+                    key: value for key, value in entries.items() if not references_deleted_file(value)
+                }
+                cls._atomic_write_json(content_index_path, content_index)
+            except (OSError, ValueError):
+                # The image index mutation is already safe and authoritative;
+                # a malformed auxiliary content index must not roll it back.
+                pass
+
+        return {
+            **result,
+            "deleted_files": deleted_files,
+            "delete_errors": delete_errors,
+        }
+
     def _active_cache_file(self, filepath: str, entry: dict) -> str | None:
         """Cache file for the variant chosen for ``filepath`` this session.
 
-        Falls back to any-variant when no active key has been recorded (e.g.
-        sourceless mode, or a freshly-loaded entry not yet validated).
+        Falls back to another source-size-eligible variant when no active key
+        has been recorded (or the requested variant failed to build).  This
+        prevents a stale high-resolution cache file from bypassing
+        AspectBucketing's no-upscale selection at load time.
         """
+        eligible = dict(self._training_eligible_variants(entry))
         key = self._active_key_by_filepath.get(filepath)
         if key is not None:
-            variant = entry.get("variants", {}).get(key)
+            variant = eligible.get(key)
             if variant is not None:
                 cache_file = variant.get("cache_file")
                 if cache_file:
                     return cache_file
-        return self._any_variant_cache_file(entry)
+        for variant in eligible.values():
+            cache_file = variant.get("cache_file")
+            if cache_file:
+                return cache_file
+        return None
 
     @staticmethod
     def _variant_for_cache_file(entry: dict, cache_file: str | None) -> dict | None:
@@ -1269,6 +1904,134 @@ class SmartDiskCache(
             if variant.get("cache_file") == cache_file:
                 return variant
         return None
+
+    def _training_eligible_variants(self, entry: dict) -> list[tuple[str, dict]]:
+        """Cached variants this source may train at without an upscale.
+
+        Sourced runs use the live AspectBucketing target map, which also lets
+        us reject every variant if the required smallest-tier fallback is
+        absent.  Sourceless runs have no started bucketing module, so they
+        recover the same rule from the stamped original/crop resolutions and
+        fall back to the smallest cached tier when the source fits none.
+        """
+        variants = [(key, value) for key, value in (entry.get("variants") or {}).items() if value.get("cache_file")]
+        if not variants:
+            return []
+        adaptive_enabled = getattr(self, "adaptive_resolution", False) and entry.get(
+            "adaptive_resolution_applied", True
+        )
+
+        source_resolution_map = dict(entry.get("source_resolutions") or {})
+        original = source_resolution_map.get("original_resolution", entry.get("original_resolution"))
+        if not isinstance(original, (list, tuple)) or len(original) < 2:
+            return [] if adaptive_enabled else variants
+        try:
+            source_h = int(original[-2])
+            source_w = int(original[-1])
+        except (TypeError, ValueError):
+            return [] if adaptive_enabled else variants
+        if source_h <= 0 or source_w <= 0:
+            return [] if adaptive_enabled else variants
+
+        additional_resolutions = []
+        for name in getattr(self, "additional_resolution_in_names", []):
+            additional = source_resolution_map.get(name)
+            if not isinstance(additional, (list, tuple)) or len(additional) < 2:
+                # In adaptive mode an unstamped required source means there is
+                # no proof that an existing high tier is safe. Validation will
+                # resolve and stamp it before building the required variant.
+                if adaptive_enabled:
+                    return []
+                continue
+            additional_resolutions.append(additional)
+        all_source_resolutions = [original, *additional_resolutions]
+
+        bucket_resolutions = getattr(self.aspect_bucketing, "bucket_resolutions", None) or {}
+        target_filter = getattr(self.aspect_bucketing, "eligible_target_resolutions", None)
+        if bucket_resolutions and target_filter is not None:
+            try:
+                targets = target_filter((source_h, source_w), list(bucket_resolutions), additional_resolutions)
+                if adaptive_enabled and targets:
+                    targets = [max(targets)]
+                aspect = source_h / source_w
+                allowed_keys = {
+                    f"{h}x{w}"
+                    for target in targets
+                    for h, w in [self.aspect_bucketing.bucket_for_aspect(aspect, target)]
+                }
+                return [(key, value) for key, value in variants if key in allowed_keys]
+            except Exception:
+                # Preserve compatibility with third-party bucketing modules;
+                # the crop-resolution path below provides the same guard.
+                pass
+
+        parsed: list[tuple[str, dict, int, int]] = []
+        for key, value in variants:
+            crop = value.get("crop_resolution")
+            if not isinstance(crop, (list, tuple)) or len(crop) < 2:
+                parts = key.split("x")
+                crop = parts if len(parts) == 2 else None
+            if crop is None:
+                continue
+            try:
+                crop_h = int(crop[-2])
+                crop_w = int(crop[-1])
+            except (TypeError, ValueError):
+                continue
+            if crop_h > 0 and crop_w > 0:
+                parsed.append((key, value, crop_h, crop_w))
+
+        if not parsed:
+            return variants
+        fitting = []
+        for key, value, crop_h, crop_w in parsed:
+            scale_h, scale_w = scale_resolution_for_crop((source_h, source_w), (crop_h, crop_w))
+            if all(int(source[-2]) >= scale_h and int(source[-1]) >= scale_w for source in all_source_resolutions):
+                fitting.append((key, value, crop_h, crop_w))
+        maximum = entry.get("adaptive_max_resolution", getattr(self, "adaptive_resolution_max", None))
+        if maximum is not None:
+            fitting = [item for item in fitting if nominal_resolution_for_crop((item[2], item[3])) <= maximum + 1]
+        if fitting:
+            if adaptive_enabled:
+                largest = max(nominal_resolution_for_crop((h, w)) for _, _, h, w in fitting)
+                return [
+                    (key, value)
+                    for key, value, h, w in fitting
+                    if abs(nominal_resolution_for_crop((h, w)) - largest) < 1
+                ]
+            return [(key, value) for key, value, _, _ in fitting]
+
+        adaptive_floor = ADAPTIVE_MIN_RESOLUTION
+        if adaptive_enabled:
+            maximum = entry.get("adaptive_max_resolution", getattr(self, "adaptive_resolution_max", None))
+            try:
+                if maximum is None:
+                    adaptive_floor = min(
+                        parse_adaptive_resolution_ladder(getattr(self, "adaptive_resolution_ladder", None))
+                    )
+                else:
+                    adaptive_floor = min(
+                        target_resolutions_for_spec(
+                            str(maximum),
+                            True,
+                            getattr(self, "adaptive_resolution_ladder", None),
+                        )
+                    )
+            except (TypeError, ValueError):
+                adaptive_floor = ADAPTIVE_MIN_RESOLUTION
+            floor_variants = [
+                (key, value) for key, value, _, _ in parsed if value.get("target_resolution") == adaptive_floor
+            ]
+            if floor_variants:
+                return floor_variants
+        smallest_nominal = min(nominal_resolution_for_crop((h, w)) for _, _, h, w in parsed)
+        if adaptive_enabled and smallest_nominal > adaptive_floor + 1:
+            return []
+        return [
+            (key, value)
+            for key, value, h, w in parsed
+            if abs(nominal_resolution_for_crop((h, w)) - smallest_nominal) < 1
+        ]
 
     def _sourceless_variant(self, entry: dict, in_index: int) -> dict | None:
         """Pick the resolution-bucket variant for a sourceless row.
@@ -1283,12 +2046,16 @@ class SmartDiskCache(
         aggregate cache always matches the variant whose latent get_item loads
         — AspectBatchSorting and collate stay shape-consistent.
         """
-        variants = entry.get("variants") or {}
-        usable = sorted((k, v) for k, v in variants.items() if v.get("cache_file"))
+        usable = sorted(self._training_eligible_variants(entry))
         if not usable:
             return None
         if len(usable) == 1:
             return usable[0][1]
+        if getattr(self, "adaptive_resolution", False) and entry.get("adaptive_resolution_applied", True):
+            return max(
+                (value for _, value in usable),
+                key=lambda value: nominal_resolution_for_crop(value.get("crop_resolution", (0, 0))),
+            )
         epoch = self.current_variation if self.current_variation >= 0 else 0
         pick = (epoch * 0x9E3779B1 + in_index * 0x85EBCA77) % len(usable)
         return usable[pick][1]
@@ -1494,7 +2261,7 @@ class SmartDiskCache(
             if len(failed) > 10:
                 print(f"  ... and {len(failed) - 10} more")
 
-    def _fast_validate(self) -> bool:
+    def _fast_validate(self, required_filepaths=None, token: dict | None = None) -> bool:
         """Fast validation: per-watched-file directory fingerprint + random spot check.
 
         Skips the expensive per-file validation loop when nothing has changed.
@@ -1506,16 +2273,33 @@ class SmartDiskCache(
         directory don't perturb the fingerprint. Renames within a directory
         that don't shift count or mtime sum are caught by the spot check
         downstream.
+
+        ``token`` carries ``last_validated`` / ``watched_fingerprints`` /
+        ``scope`` for the caller's role and dataset (``_role_validation_token``);
+        None reads the legacy top-level stamps. With ``scope == "required"`` the
+        sidecar-migration check, fingerprint and spot-check cover only
+        ``required_filepaths``: rows another loader sharing this cache dir owns
+        can neither invalidate nor vouch for this loader's rows.
         """
-        last_validated = self.cache_index.get("last_validated")
+        if token is None:
+            token = {
+                "last_validated": self.cache_index.get("last_validated"),
+                "watched_fingerprints": self.cache_index.get("watched_fingerprints"),
+                "scope": "all",
+            }
+        last_validated = token.get("last_validated")
         if last_validated is None:
             return False
 
         entries = self.cache_index.get("entries", {})
         if not entries:
             return False
+        if required_filepaths is not None and token.get("scope") == "required":
+            entries = {fp: entries[fp] for fp in required_filepaths if fp in entries}
+            if not entries:
+                return False
 
-        stored_fp_raw = self.cache_index.get("watched_fingerprints")
+        stored_fp_raw = token.get("watched_fingerprints")
         if stored_fp_raw is None:
             # Legacy cache without fingerprint — force a full pass so the
             # fingerprint gets written for next time.
@@ -1983,11 +2767,8 @@ class SmartDiskCache(
         """
         if not isinstance(metadata, dict) or not metadata:
             return None
-        group_values = metadata.get("group_values")
-        if group_values is None:
-            group_values = [""]
         try:
-            return self.__string_key(group_values)
+            return self._metadata_group_key(metadata)
         except TypeError:
             return None
 
@@ -2238,13 +3019,29 @@ class SmartDiskCache(
         # actual variant lookup and crashing AspectBatchSorting later.
         # Pulled from the walker cache (CalcAspect already ran during
         # the split-fetch loop above), so this is free.
-        original_resolution = None
-        try:
-            res = self._get_previous_item(0, "original_resolution", in_index)
-            if res is not None and len(res) >= 2:
-                original_resolution = [int(res[-2]), int(res[-1])]
-        except Exception:
-            original_resolution = None
+        source_resolutions = {}
+        for resolution_name in ["original_resolution", *self.additional_resolution_in_names]:
+            try:
+                res = self._get_previous_item(0, resolution_name, in_index)
+                if res is not None and len(res) >= 2:
+                    source_resolutions[resolution_name] = [int(res[-2]), int(res[-1])]
+            except Exception:  # noqa: PERF203 - each optional resolution is independent
+                continue
+        original_resolution = source_resolutions.get("original_resolution")
+        adaptive_max_resolution = None
+        if self.adaptive_resolution and self.aspect_bucketing is not None:
+            try:
+                target_spec = self.aspect_bucketing._target_resolutions_for_item(0, in_index)
+                adaptive_max_resolution = max(
+                    target_resolutions_for_spec(
+                        str(target_spec),
+                        True,
+                        getattr(self, "adaptive_resolution_ladder", None),
+                    ),
+                    default=None,
+                )
+            except Exception:
+                adaptive_max_resolution = None
         key = self._resolution_key(resolution)
         with self._index_lock:
             entry = self.cache_index["entries"].get(filepath)
@@ -2261,6 +3058,12 @@ class SmartDiskCache(
                 }
                 if original_resolution is not None:
                     entry["original_resolution"] = original_resolution
+                if source_resolutions:
+                    entry["source_resolutions"] = source_resolutions
+                if adaptive_max_resolution is not None:
+                    entry["adaptive_max_resolution"] = adaptive_max_resolution
+                if self.adaptive_resolution:
+                    entry["adaptive_resolution_applied"] = adaptive_max_resolution is not None
                 entry["sourceless"] = self._sourceless_metadata(in_index, variations)
                 row = entry.setdefault("sourceless_rows", {}).setdefault(str(in_index), {})
                 row["metadata"] = entry["sourceless"]
@@ -2279,6 +3082,12 @@ class SmartDiskCache(
                 entry["sidecar_hashes"] = sidecar_hashes
                 if original_resolution is not None:
                     entry["original_resolution"] = original_resolution
+                if source_resolutions:
+                    entry["source_resolutions"] = source_resolutions
+                if adaptive_max_resolution is not None:
+                    entry["adaptive_max_resolution"] = adaptive_max_resolution
+                if self.adaptive_resolution:
+                    entry["adaptive_resolution_applied"] = adaptive_max_resolution is not None
                 entry["sourceless"] = self._sourceless_metadata(in_index, variations)
                 row = entry.setdefault("sourceless_rows", {}).setdefault(str(in_index), {})
                 row["metadata"] = entry["sourceless"]
@@ -2290,6 +3099,9 @@ class SmartDiskCache(
                 "cache_file": cache_file,
                 "schema_keys": sorted(set(self.split_names) | set(self.aggregate_names)),
             }
+            target_resolution = self._target_int_for_resolution_key(resolution)
+            if target_resolution is not None:
+                variant_record["target_resolution"] = target_resolution
             # Stamp the .pt's actual stored crop_resolution so the agg
             # fast path can serve it without torch.load and — critically —
             # without round-tripping the variant key string through bucket
@@ -2385,6 +3197,7 @@ class SmartDiskCache(
             with self._index_lock:
                 entry["sidecar_mtimes"] = mtimes
                 entry["sidecar_hashes"] = hashes
+            self._index_dirty = True
             return True
 
         watched_paths = set(expected_paths.values())
@@ -2425,6 +3238,7 @@ class SmartDiskCache(
             # fingerprint pass matches.
             with self._index_lock:
                 stored_mtimes[path] = current_mtime
+            self._index_dirty = True
 
         return True
 
@@ -2537,6 +3351,20 @@ class SmartDiskCache(
             records = []
             for filepath, entry in entries.items():
                 records.extend(self._entry_sourceless_row_records(filepath, entry))
+            if self.adaptive_resolution:
+                eligible_records = []
+                dropped_records = 0
+                for record in records:
+                    entry = entries.get(record["filepath"], {})
+                    if self._training_eligible_variants(entry):
+                        eligible_records.append(record)
+                    else:
+                        dropped_records += 1
+                records = eligible_records
+                if dropped_records:
+                    self._status(
+                        f"adaptive sourceless resolution: dropped {dropped_records} rows without a safe cached tier"
+                    )
             has_source_indices = any(record.get("source_index") != 1 << 60 for record in records)
             if has_source_indices:
                 records = sorted(records, key=lambda record: (record.get("source_index", 1 << 60), record["filepath"]))
@@ -2630,6 +3458,9 @@ class SmartDiskCache(
             self.__init_variations()
         self.__reshuffle_samples(out_variation)
 
+        self._index_dirty = False
+        self._epoch_keys = None
+
         # Reload the index from disk only when we don't hold one yet or the
         # file changed under us (external writer, e.g. gc from another run).
         # This process is otherwise the only writer, so re-parsing a
@@ -2666,8 +3497,14 @@ class SmartDiskCache(
         # can't assume the cache was built under the *current* config, and
         # the recovery pass is cheap (O(N) aspect math, no image decode) on
         # the happy path where keys already match.
+        #
+        # Stamps are compared per role (see _role_signature): instances with
+        # different configurations sharing this cache dir each keep their own,
+        # so one no longer reads the other's stamp as drift on every refresh.
+        role_sig = self._role_signature()
+        role_stamps = self._role_stamps(role_sig)
         current_bucket_method = self._compute_bucket_method()
-        stored_bucket_method = self.cache_index.get("bucket_method")
+        stored_bucket_method = role_stamps["bucket_method"]
         bucket_drift = current_bucket_method is not None and stored_bucket_method != current_bucket_method
 
         # Schema drift: if split_names/aggregate_names changed since the cache
@@ -2678,8 +3515,8 @@ class SmartDiskCache(
         # place. Run before any fast-path return so downstream readers
         # always find what they need.
         required_schema = sorted(set(self.split_names) | set(self.aggregate_names))
-        stored_schema = self.cache_index.get("schema")
-        stored_method = self.cache_index.get("schema_method")
+        stored_schema = role_stamps["schema"]
+        stored_method = role_stamps["schema_method"]
         if self.cache_index.get("entries") and (stored_schema != required_schema or stored_method != SCHEMA_METHOD):
             self._status("checking cache schema drift")
             targets: set[str] = set()
@@ -2696,8 +3533,9 @@ class SmartDiskCache(
             if targets:
                 self._augment_cache_with_missing_names(targets)
 
-            self.cache_index["schema"] = required_schema
-            self.cache_index["schema_method"] = SCHEMA_METHOD
+            self._stamp_role(role_sig, schema=required_schema, schema_method=SCHEMA_METHOD)
+            self.cache_index["last_role"] = role_sig
+            self._index_dirty = True
             self._save_cache_index()
 
         # Resolve the source filepaths this call will deliver.
@@ -2720,9 +3558,27 @@ class SmartDiskCache(
                         required_sidecar_paths.update(extras.values())
         self._status(f"resolved {len(required_filepaths)} unique source paths ({len(required_sidecar_paths)} sidecars)")
 
+        # Cross-role schema check: when another role saved since this one last
+        # looked, it may have rebuilt a shared file's variant with a narrower
+        # schema. Index-only (schema_keys), so cheap; augments just the missing
+        # names. Runs in every mode, trust included, before any skip path.
+        if self.cache_index.get("entries") and self.cache_index.get("last_role") != role_sig:
+            missing_names = self._missing_schema_names(required_filepaths)
+            if missing_names:
+                self._status(f"another cache role left {sorted(missing_names)} missing; augmenting")
+                self._augment_cache_with_missing_names(missing_names)
+                self._index_dirty = True
+                self.cache_index["last_role"] = role_sig
+                self._save_cache_index()
+            else:
+                # In memory only: persisted with the next real save. A reload
+                # after another role's save brings back that role's marker.
+                self.cache_index["last_role"] = role_sig
+
         skip_validation = self.trust_cache or os.environ.get("OT_SKIP_CACHE_VALIDATION") == "1"
         if not skip_validation:
             if not self._sourceless_index_metadata_ready(index_to_filepath):
+                self._index_dirty = True
                 self._status("updating sourceless cache index metadata")
                 upgraded = self._upgrade_sourceless_runtime_values(index_to_filepath)
                 if upgraded:
@@ -2817,25 +3673,62 @@ class SmartDiskCache(
         # arithmetic, no image decode. Runs before validation so the per-index
         # loop sees the new variants registered.
         if bucket_drift:
+            self._index_dirty = True
             self._status("cache bucket method changed; recovering variant links")
             self._drift_recovery_pass()
 
         # --- Fast validation path ---
         # Bypassed on bucket drift: the recovery pass may have queued new
         # variants that need rebuild, so we have to fall through. Also
-        # bypassed under multi-target aspect bucketing: the per-epoch
+        # bypassed under random multi-target aspect bucketing: the per-epoch
         # required variant rotates, and fast-validate only spot-checks
         # whichever variant is currently registered — it would skip the
         # lazy-build pass for this epoch's missing key.
+        #
+        # Adaptive resolution is multi-target but not random: every row always
+        # takes its largest eligible tier. There the fast path runs, gated by
+        # _adaptive_fast_path_guard proving every row's required variant is on
+        # disk; if the guard declines, full validation runs exactly as before.
+        adaptive_single_target = (
+            multi_target
+            and bool(getattr(self, "adaptive_resolution", False))
+            and bool(getattr(self.aspect_bucketing, "adaptive_resolution", False))
+        )
+        dataset_digest = self._dataset_digest(required_filepaths) if not skip_validation else None
         if (
             not skip_validation
             and not bucket_drift
-            and not multi_target
+            and (not multi_target or adaptive_single_target)
             and self.cache_index.get("entries")
-            and self._fast_validate()
+            and self._fast_validate(required_filepaths, self._role_validation_token(role_sig, dataset_digest))
         ):
             all_in_index = all(fp in self.cache_index["entries"] for fp in required_filepaths)
-            if all_in_index:
+            if all_in_index and adaptive_single_target:
+                verified, failure = self._adaptive_fast_path_guard(index_to_filepath, out_variation)
+                if verified is not None:
+                    epoch_keys, verified_variants, stamps_changed = verified
+                    self._source_path_cache = dict(index_to_filepath)
+                    for in_index, resolution in epoch_keys.items():
+                        self._active_key_by_filepath[index_to_filepath[in_index]] = self._resolution_key(resolution)
+                    n = len(self.cache_index["entries"])
+                    checked = getattr(self, "_fast_validate_sample_size", "?")
+                    print(
+                        f"SmartDiskCache: Fast validation passed ({n} entries, {checked} spot-checked, "
+                        f"{len(verified_variants)} adaptive variants verified)"
+                    )
+                    self._session_validated_filepaths.update(required_filepaths)
+                    self._session_validated_variants.update(verified_variants)
+                    if stamps_changed:
+                        # The guard's resolve re-stamped adaptive fields (e.g. a
+                        # concept's resolution cap changed); persist them.
+                        self._index_dirty = True
+                        self.cache_index["last_role"] = role_sig
+                        self._save_cache_index()
+                    self._epoch_keys = (out_variation, epoch_keys)
+                    self._load_aggregate_cache(out_variation)
+                    return
+                print(f"SmartDiskCache: adaptive fast validation declined ({failure}); running full validation")
+            elif all_in_index:
                 self._source_path_cache = dict(index_to_filepath)
                 self._populate_active_keys(required_filepaths)
                 n = len(self.cache_index["entries"])
@@ -2863,8 +3756,10 @@ class SmartDiskCache(
         # state, so whatever guarantee the token carried still holds — popping
         # it here would permanently knock later non-trust runs off the fast
         # path (the re-stamp at the end is also gated on full validation).
+        previous_token = None
         if not skip_validation:
             self.cache_index.pop("last_validated", None)
+            previous_token = self._pop_role_validation(role_sig, dataset_digest)
 
         files_built = 0
         files_skipped = 0
@@ -2889,6 +3784,32 @@ class SmartDiskCache(
                     if skip_validation:
                         cached_fp = index_to_filepath.get(in_index)
                         if cached_fp is not None and cached_fp in self.cache_index["entries"]:
+                            if self.adaptive_resolution and self.aspect_bucketing is not None:
+                                trusted_entry = self.cache_index["entries"][cached_fp]
+                                stamp_before = self._resolution_stamp_token(trusted_entry)
+                                resolution = self._fast_resolution_string(trusted_entry, out_variation, in_index)
+                                if self._resolution_stamp_token(trusted_entry) != stamp_before:
+                                    self._index_dirty = True
+                                if resolution is None:
+                                    resolution = self._get_resolution_string(out_variation, in_index)
+                                active_key = self._resolution_key(resolution)
+                                self._active_key_by_filepath[cached_fp] = active_key
+                                variant = (trusted_entry.get("variants") or {}).get(active_key)
+                                if not variant or not variant.get("cache_file"):
+                                    # Trust skips source staleness checks, not
+                                    # creation of the tier this policy needs.
+                                    items_to_build_by_index[in_index] = (
+                                        cached_fp,
+                                        group_key,
+                                        out_variation,
+                                        in_index,
+                                        group_index,
+                                        variations,
+                                        resolution,
+                                    )
+                                    self._source_path_cache[in_index] = cached_fp
+                                    bar.update(1)
+                                    continue
                             self._source_path_cache[in_index] = cached_fp
                             files_skipped += 1
                             bar.update(1)
@@ -2919,9 +3840,12 @@ class SmartDiskCache(
                         # when there's no aspect to recover, i.e. fresh
                         # entries the very first time we see them.
                         if self.resolution_from_upstream or self.aspect_bucketing is not None:
+                            stamp_before = self._resolution_stamp_token(entry)
                             resolution = self._fast_resolution_string(entry, out_variation, in_index)
                             if resolution is None:
                                 resolution = self._get_resolution_string(out_variation, in_index)
+                            if self._resolution_stamp_token(entry) != stamp_before:
+                                self._index_dirty = True
                             active_key = self._resolution_key(resolution)
                             self._active_key_by_filepath[filepath] = active_key
                         else:
@@ -2969,6 +3893,7 @@ class SmartDiskCache(
                             # them to the next gc sweep.
                             with self._index_lock:
                                 (entry.get("variants") or {}).pop(active_key, None)
+                            self._index_dirty = True
                             resolution = None if active_key == NO_RESOLUTION_KEY else active_key
                             items_to_build_by_index[in_index] = (
                                 filepath,
@@ -2991,6 +3916,7 @@ class SmartDiskCache(
                             if filepath in self.cache_index["entries"]:
                                 del self.cache_index["entries"][filepath]
                             self._active_key_by_filepath.pop(filepath, None)
+                        self._index_dirty = True
 
                     # Rebuild path: now we DO need the current resolution —
                     # but computing it opens the image through the full
@@ -3045,6 +3971,12 @@ class SmartDiskCache(
 
             if not items_to_build:
                 continue
+
+            # Builds, dedups and failures all change the index. Claim the
+            # role marker before the first periodic flush can persist .pt
+            # writes, so other roles re-check schemas even after a crash.
+            self._index_dirty = True
+            self.cache_index["last_role"] = role_sig
 
             # before_cache_fun is NOT called here anymore — it's deferred to
             # the first variation that needs an actual upstream encode (see
@@ -3205,18 +4137,37 @@ class SmartDiskCache(
             # pass already stamped their index metadata in-context, and the
             # presence-gated pre-validation pass backfills any stragglers. A
             # second full sweep every epoch was pure churn.
-            self.cache_index["last_validated"] = time.time()
-            # Per-watched-file fingerprint: ignored if any parent dir is
-            # unreachable (returns None); a missing fingerprint just means the
-            # next run pays for one extra full validation pass.
-            self.cache_index["watched_fingerprints"] = (
-                self._compute_watched_fingerprints(self.cache_index["entries"]) or {}
-            )
-        self.cache_index["schema"] = required_schema
-        self.cache_index["schema_method"] = SCHEMA_METHOD
+            #
+            # Per-watched-file fingerprint over this loader's rows only (the
+            # token is keyed by role + dataset digest): ignored if any parent
+            # dir is unreachable (returns None); a missing fingerprint just
+            # means the next run pays for one extra full validation pass. A
+            # clean pass reproducing the previous fingerprint keeps that token
+            # instead of bumping its timestamp, so it doesn't force a save.
+            entries = self.cache_index["entries"]
+            scoped_entries = {fp: entries[fp] for fp in required_filepaths if fp in entries}
+            fingerprint = self._compute_watched_fingerprints(scoped_entries) or {}
+            if (
+                previous_token is not None
+                and not self._index_dirty
+                and self._same_fingerprints(previous_token.get("watched_fingerprints"), fingerprint)
+            ):
+                token = previous_token
+            else:
+                token = {"last_validated": time.time(), "watched_fingerprints": fingerprint}
+                self._index_dirty = True
+            self._stamp_role_validation(role_sig, dataset_digest, token)
+        final_stamps = {"schema": required_schema, "schema_method": SCHEMA_METHOD}
         if current_bucket_method is not None:
-            self.cache_index["bucket_method"] = current_bucket_method
-        self._save_cache_index()
+            final_stamps["bucket_method"] = current_bucket_method
+        if self._stamp_role(role_sig, **final_stamps):
+            self._index_dirty = True
+        # Only write when this refresh changed something: a no-op rewrite of
+        # a huge index costs seconds here and a full re-parse in every other
+        # instance sharing the dir (its stale check sees the new stat).
+        if self._index_dirty:
+            self.cache_index["last_role"] = role_sig
+            self._save_cache_index()
         self._save_content_index()
 
         # Mark every required filepath that ended up with a valid entry as
@@ -3282,6 +4233,19 @@ class SmartDiskCache(
         """
         if self.aspect_bucketing is None:
             return None
+        if getattr(self, "adaptive_resolution", False):
+            try:
+                target_spec = self.aspect_bucketing._target_resolutions_for_item(in_variation, in_index)
+                targets = target_resolutions_for_spec(
+                    str(target_spec),
+                    True,
+                    getattr(self, "adaptive_resolution_ladder", None),
+                )
+                entry["adaptive_resolution_applied"] = bool(targets)
+                if targets:
+                    entry["adaptive_max_resolution"] = max(targets)
+            except Exception:
+                pass
         # Prefer the stamped original_resolution (exact aspect) over the
         # variant-key approximation. Bucket aspect grids differ across
         # targets; recovering aspect from a 768-target variant key and
@@ -3289,14 +4253,17 @@ class SmartDiskCache(
         # bucket than the image's actual aspect would — that mismatch
         # is exactly what causes AspectBatchSorting to bucket items at
         # sort time differently from what get_item loads at fetch time.
-        orig = entry.get("original_resolution")
+        source_resolution_map = dict(entry.get("source_resolutions") or {})
+        orig = source_resolution_map.get("original_resolution", entry.get("original_resolution"))
         aspect: float | None = None
+        original_resolution: tuple[int, int] | None = None
         if isinstance(orig, (list, tuple)) and len(orig) >= 2:
             try:
                 h = float(orig[-2])
                 w = float(orig[-1])
                 if w > 0:
                     aspect = h / w
+                    original_resolution = (int(h), int(w))
             except (TypeError, ValueError):
                 aspect = None
         if aspect is None:
@@ -3319,7 +4286,10 @@ class SmartDiskCache(
                     w = float(upstream[-1])
                     if w > 0:
                         aspect = h / w
-                        entry["original_resolution"] = [int(h), int(w)]
+                        original_resolution = (int(h), int(w))
+                        entry["original_resolution"] = list(original_resolution)
+                        source_resolution_map["original_resolution"] = list(original_resolution)
+                        entry["source_resolutions"] = source_resolution_map
                 except (TypeError, ValueError):
                     aspect = None
         if aspect is None:
@@ -3330,7 +4300,33 @@ class SmartDiskCache(
             aspect = self._aspect_from_variant_keys(variants)
         if aspect is None:
             return None
+
+        additional_resolutions = []
+        for resolution_name in getattr(self, "additional_resolution_in_names", []):
+            additional = source_resolution_map.get(resolution_name)
+            if not isinstance(additional, (list, tuple)) or len(additional) < 2:
+                walk_variation = self.current_variation if self.current_variation >= 0 else in_variation
+                try:
+                    additional = self._get_previous_item(walk_variation, resolution_name, in_index)
+                except Exception:
+                    additional = None
+                if isinstance(additional, (list, tuple)) and len(additional) >= 2:
+                    additional = [int(additional[-2]), int(additional[-1])]
+                    source_resolution_map[resolution_name] = additional
+                    entry["source_resolutions"] = source_resolution_map
+            if not isinstance(additional, (list, tuple)) or len(additional) < 2:
+                if getattr(self, "adaptive_resolution", False):
+                    return None
+                continue
+            additional_resolutions.append((int(additional[-2]), int(additional[-1])))
         try:
+            if original_resolution is not None:
+                resolution_selector = getattr(self.aspect_bucketing, "variant_key_from_resolutions", None)
+                if resolution_selector is not None:
+                    return resolution_selector(in_variation, in_index, original_resolution, additional_resolutions)
+                resolution_selector = getattr(self.aspect_bucketing, "variant_key_from_resolution", None)
+                if resolution_selector is not None:
+                    return resolution_selector(in_variation, in_index, original_resolution)
             return self.aspect_bucketing.variant_key_from_aspect(in_variation, in_index, aspect)
         except Exception:
             return None
@@ -3372,7 +4368,10 @@ class SmartDiskCache(
             if variant is None:
                 return None
         else:
-            resolution = self._fast_resolution_string(entry, in_variation, in_index)
+            # Keys the adaptive fast-path guard already proved this refresh.
+            resolution = self._epoch_key(in_variation, in_index)
+            if resolution is None:
+                resolution = self._fast_resolution_string(entry, in_variation, in_index)
             if resolution is None:
                 resolution = self._get_resolution_string(in_variation, in_index)
             if resolution is None or resolution == NO_RESOLUTION_KEY:
@@ -3523,7 +4522,9 @@ class SmartDiskCache(
                     # Falls back to the upstream image-decode walk only
                     # when no aspect can be recovered. Rotation is seeded
                     # on the epoch variation, matching validation/get_item.
-                    resolution = self._fast_resolution_string(cache_entry, out_variation, in_index)
+                    resolution = self._epoch_key(out_variation, in_index)
+                    if resolution is None:
+                        resolution = self._fast_resolution_string(cache_entry, out_variation, in_index)
                     if resolution is None:
                         resolution = self._get_resolution_string(out_variation, in_index)
                     if resolution is not None:
@@ -3622,7 +4623,36 @@ class SmartDiskCache(
                     pass
 
         template = None
+        # Prefer a variant whose recorded schema covers every required name.
+        # Loaders with different schemas share a cache dir (SFT + DPO); a
+        # template taken from the other loader's narrower .pt produced a
+        # sentinel missing this loader's names, so it was rewritten on every
+        # start. Bounded attempts, then the original any-entry fallback.
+        attempts = 0
         for entry in self.cache_index.get("entries", {}).values():
+            if template is not None or attempts >= 8:
+                break
+            if entry.get("modeltype") != self.modeltype:
+                continue
+            for variant in (entry.get("variants") or {}).values():
+                cache_file = variant.get("cache_file")
+                schema_keys = variant.get("schema_keys")
+                if not cache_file or schema_keys is None or not required.issubset(schema_keys):
+                    continue
+                pt = self._real_pt_path(cache_file, 0)
+                if not os.path.isfile(pt):
+                    continue
+                attempts += 1
+                try:
+                    candidate = torch.load(pt, weights_only=False, map_location="cpu")
+                except Exception:
+                    break
+                if required.issubset(k for k in candidate if not k.startswith("__")):
+                    template = candidate
+                break
+        for entry in self.cache_index.get("entries", {}).values():
+            if template is not None:
+                break
             if entry.get("modeltype") != self.modeltype:
                 continue
             cache_file = self._any_variant_cache_file(entry)
@@ -3656,9 +4686,13 @@ class SmartDiskCache(
             return
 
         with self._index_lock:
+            sentinel_changed = self.cache_index.get("blank_sentinel") != out_name
             self.cache_index["blank_sentinel"] = out_name
         self._blank_sentinel_memo = None
-        self._save_cache_index()
+        # The .pt is already replaced atomically; the index only needs a write
+        # when the recorded name changed.
+        if sentinel_changed:
+            self._save_cache_index()
 
     def _load_blank_sentinel(self) -> dict | None:
         # Memoized: this fires per cache-miss get_item, i.e. per sample per
@@ -4011,8 +5045,8 @@ class SmartDiskCache(
 
         tmp_path = cache_path + ".tmp"
         bak_path = cache_path + ".bak"
-        with open(tmp_path, "w") as f:
-            json.dump(index, f, indent=2)
+        with open(tmp_path, "wb") as f:
+            f.write(json.dumps(index, separators=(",", ":")).encode("utf-8"))
         if os.path.exists(cache_path):
             shutil.copy2(cache_path, bak_path)
         os.replace(tmp_path, cache_path)
