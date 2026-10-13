@@ -64,6 +64,25 @@ RESOLUTION_PENDING = object()
 # encode the frame dim.
 _DERIVABLE_AGGREGATES = frozenset({"crop_resolution", "image_path"})
 
+
+def _replace_retrying(src: str, dst: str, attempts: int = 8, delay: float = 0.05) -> None:
+    """os.replace that rides out a transient PermissionError.
+
+    On Windows, replacing a file another handle has open (a reader, or a second
+    build worker renaming its own copy of the same content-addressed .pt at the
+    same moment) fails with WinError 5. Content-addressed names make that race
+    routine when two samples share a caption, so retry briefly with backoff.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:  # noqa: PERF203 - the retry is the point
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay * (2**attempt))
+
+
 # Caption strings a sample_prompt_path cache stamps as sourceless runtime
 # values. Blanked (keys kept) when store_sourceless_prompts is False.
 SOURCELESS_PROMPT_NAMES = ("prompt", "prompt_1", "prompt_2")
@@ -83,6 +102,7 @@ class SmartDiskCache(
     store_sourceless_prompts = True
     scrub_split_names: tuple[str, ...] | list[str] = ()
     _disk_index_may_hold_prompts = False
+
     def __init__(
         self,
         cache_dir: str,
@@ -939,7 +959,7 @@ class SmartDiskCache(
         tmp_path = real_pt_path + f".{os.getpid()}.{threading.get_ident()}.tmp"
         try:
             torch.save(cache_data, tmp_path)
-            os.replace(tmp_path, real_pt_path)
+            _replace_retrying(tmp_path, real_pt_path)
         except OSError:
             with contextlib.suppress(OSError):
                 os.remove(tmp_path)
@@ -2297,7 +2317,7 @@ class SmartDiskCache(
                     tmp_path = real_pt + f".{os.getpid()}.{threading.get_ident()}.aug.tmp"
                     try:
                         torch.save(cache_data, tmp_path)
-                        os.replace(tmp_path, real_pt)
+                        _replace_retrying(tmp_path, real_pt)
                         wrote_anything = True
                     except Exception as e:
                         with contextlib.suppress(OSError):
@@ -2847,7 +2867,12 @@ class SmartDiskCache(
     def _save_pt_atomic(self, cache_data: dict, real_pt_path: str) -> None:
         real_tmp_path = real_pt_path + f".{os.getpid()}.{threading.get_ident()}.tmp"
         torch.save(cache_data, real_tmp_path)
-        os.replace(real_tmp_path, real_pt_path)
+        try:
+            _replace_retrying(real_tmp_path, real_pt_path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.remove(real_tmp_path)
+            raise
 
     def _sourceless_row_group_key(self, metadata: Any) -> str | None:
         """Group key recomputed from a stamped row's metadata.
