@@ -64,6 +64,10 @@ RESOLUTION_PENDING = object()
 # encode the frame dim.
 _DERIVABLE_AGGREGATES = frozenset({"crop_resolution", "image_path"})
 
+# Caption strings a sample_prompt_path cache stamps as sourceless runtime
+# values. Blanked (keys kept) when store_sourceless_prompts is False.
+SOURCELESS_PROMPT_NAMES = ("prompt", "prompt_1", "prompt_2")
+
 
 class CachingStoppedException(Exception):
     pass
@@ -73,6 +77,12 @@ class SmartDiskCache(
     PipelineModule,
     SingleVariationRandomAccessPipelineModule,
 ):
+    # Class-level defaults for the caption-privacy knobs (see __init__), so
+    # instances built without __init__ (tests, offline tools) keep the
+    # historical behavior.
+    store_sourceless_prompts = True
+    scrub_split_names: tuple[str, ...] | list[str] = ()
+    _disk_index_may_hold_prompts = False
     def __init__(
         self,
         cache_dir: str,
@@ -101,6 +111,8 @@ class SmartDiskCache(
         additional_resolution_in_names: list[str] | None = None,
         adaptive_resolution_max: int | None = None,
         adaptive_resolution_ladder: str | list[int] | None = None,
+        store_sourceless_prompts: bool = True,
+        scrub_split_names: list[str] | None = None,
     ):
         super().__init__()
         self.cache_dir = cache_dir
@@ -108,6 +120,25 @@ class SmartDiskCache(
 
         self.split_names = [] if split_names is None else split_names
         self.aggregate_names = [] if aggregate_names is None else aggregate_names
+
+        # Caption privacy (both opt-in, neither part of any cache fingerprint,
+        # so toggling them never invalidates existing entries):
+        # - store_sourceless_prompts=False stamps "" for every prompt /
+        #   prompt_1 / prompt_2 runtime value (index rows and the legacy .pt
+        #   __sourceless_values block). The keys stay, so sourceless
+        #   validation still sees a resolved row; sourceless runs then serve
+        #   "" for those names. Prompts already stored in a loaded index are
+        #   blanked on load and persisted by the next save.
+        # - scrub_split_names lists split tensors (e.g. token ids) that are
+        #   written as zeros_like on every .pt write: same shape and dtype,
+        #   no content. Only safe for names nothing downstream reads the
+        #   values of (e.g. tokens next to a cached hidden state + mask).
+        self.store_sourceless_prompts = store_sourceless_prompts
+        self.scrub_split_names = list(scrub_split_names or [])
+        # True while cache.json on disk may still hold prompts that this
+        # instance blanked on load; the next save then skips the .bak copy
+        # (which would preserve them) and removes any stale one.
+        self._disk_index_may_hold_prompts = False
 
         self.variations_in_name = variations_in_name
         self.balancing_in_name = balancing_in_name
@@ -601,8 +632,55 @@ class SmartDiskCache(
         legacy = data.get("version", 0) < CACHE_VERSION
         self._migrate_legacy_index_in_place(data)
         interned = self._migrate_intern_sourceless_concepts(data)
-        if legacy or interned or recovered:
+        blanked = 0
+        if not self.store_sourceless_prompts:
+            blanked = self._blank_stored_prompts(data)
+            if blanked:
+                self._disk_index_may_hold_prompts = True
+        if legacy or interned or recovered or blanked:
             self._index_dirty = True
+
+    @staticmethod
+    def _blank_prompt_block(block: Any) -> int:
+        """Blank prompt values of one per-variation runtime block; returns count."""
+        if not isinstance(block, dict):
+            return 0
+        blanked = 0
+        for values in block.values():
+            if not isinstance(values, dict):
+                continue
+            for name in SOURCELESS_PROMPT_NAMES:
+                if name in values and values[name] != "":
+                    values[name] = ""
+                    blanked += 1
+        return blanked
+
+    @classmethod
+    def _blank_stored_prompts(cls, cache_index: dict) -> int:
+        """Blank every prompt string stamped into an index (rows + legacy
+        entry-level block), keeping the keys. Returns the number blanked."""
+        blanked = 0
+        for entry in (cache_index.get("entries") or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            for row in (entry.get("sourceless_rows") or {}).values():
+                if isinstance(row, dict):
+                    blanked += cls._blank_prompt_block(row.get("runtime_values"))
+            blanked += cls._blank_prompt_block(entry.get("sourceless_runtime_values"))
+        return blanked
+
+    def _scrub_cache_payload(self, cache_data: dict) -> None:
+        """Apply the caption-privacy knobs to a .pt payload about to be saved."""
+        for name in self.scrub_split_names:
+            value = cache_data.get(name)
+            if torch.is_tensor(value):
+                cache_data[name] = torch.zeros_like(value)
+        if not self.store_sourceless_prompts:
+            values = cache_data.get("__sourceless_values")
+            if isinstance(values, dict):
+                for name in SOURCELESS_PROMPT_NAMES:
+                    if name in values:
+                        values[name] = ""
 
     @staticmethod
     def _migrate_legacy_index_in_place(idx: dict) -> None:
@@ -674,12 +752,20 @@ class SmartDiskCache(
                 f.write(payload.encode("utf-8"))
 
             # The .bak copy is crash insurance for the final save; copying a
-            # multi-MB file on every periodic flush was pure overhead.
-            if backup and os.path.exists(cache_path):
+            # multi-MB file on every periodic flush was pure overhead. Skipped
+            # (and any stale .bak dropped) while the on-disk index may still
+            # hold prompts this instance blanked: backing it up would keep
+            # the very captions store_sourceless_prompts=False removes.
+            purge_prompt_backup = self._disk_index_may_hold_prompts
+            if backup and not purge_prompt_backup and os.path.exists(cache_path):
                 with contextlib.suppress(OSError):
                     shutil.copy2(cache_path, bak_path)
 
             os.replace(tmp_path, cache_path)
+            if purge_prompt_backup:
+                with contextlib.suppress(OSError):
+                    os.remove(bak_path)
+                self._disk_index_may_hold_prompts = False
             self._index_disk_stat = self._snapshot_index_stat()
 
     def _flush_cache_index(self):
@@ -846,6 +932,8 @@ class SmartDiskCache(
         cache_data["__cache_version"] = CACHE_VERSION
         cache_data["__modeltype"] = self.modeltype
         self._stamp_sourceless_runtime_values(cache_data, in_variation, in_index)
+        # The donor may predate the privacy knobs; the copy must not.
+        self._scrub_cache_payload(cache_data)
 
         real_pt_path = os.path.join(self._real_cache_dir, pt_name)
         tmp_path = real_pt_path + f".{os.getpid()}.{threading.get_ident()}.tmp"
@@ -2204,6 +2292,7 @@ class SmartDiskCache(
                                 cache_data[name] = self.__clone_for_cache(value)
                     except Exception as e:
                         return filepath, f"compute_failed: {e}"
+                    self._scrub_cache_payload(cache_data)
 
                     tmp_path = real_pt + f".{os.getpid()}.{threading.get_ident()}.aug.tmp"
                     try:
@@ -2457,10 +2546,12 @@ class SmartDiskCache(
             values["concept"] = copy.deepcopy(concept)
 
         if self.source_path_in_name == "sample_prompt_path":
-            for name in ("prompt", "prompt_1", "prompt_2"):
+            for name in SOURCELESS_PROMPT_NAMES:
                 value = self._safe_previous_item(in_variation, name, in_index)
                 if value is not None:
-                    values[name] = copy.deepcopy(value)
+                    # Key kept even when blanked: sourceless serving and the
+                    # row-presence checks only look for the key.
+                    values[name] = copy.deepcopy(value) if self.store_sourceless_prompts else ""
 
         return values
 
@@ -2869,6 +2960,8 @@ class SmartDiskCache(
                         row = entry.setdefault("sourceless_rows", {}).setdefault(str(in_index), {})
                         row["metadata"] = metadata
                         row["runtime_values"] = copy.deepcopy(candidate.get("runtime_values"))
+                        if not self.store_sourceless_prompts:
+                            self._blank_prompt_block(row["runtime_values"])
                         if "concept_id" in candidate:
                             row["concept_id"] = candidate["concept_id"]
                         else:
@@ -2994,6 +3087,7 @@ class SmartDiskCache(
                 # index registration on later runs (see the reuse branch).
                 cache_data["__content_hash"] = content_hash
             self._stamp_sourceless_runtime_values(cache_data, v, in_index)
+            self._scrub_cache_payload(cache_data)
 
             real_pt_path = self._real_pt_path(cache_file, v)
             self._save_pt_atomic(cache_data, real_pt_path)
@@ -3469,6 +3563,11 @@ class SmartDiskCache(
             self._status(f"loading cache index from {self.cache_dir}")
             self.cache_index = self._load_cache_index()
             self._index_disk_stat = self._snapshot_index_stat()
+            if self._disk_index_may_hold_prompts:
+                # Prompts were blanked on load (store_sourceless_prompts off).
+                # Persist now: the fast-validation paths below return without
+                # saving, which would leave the captions on disk indefinitely.
+                self._save_cache_index()
         os.makedirs(self.cache_dir, exist_ok=True)
         self._source_path_cache = {}
         self._aggregate_cache = {}
