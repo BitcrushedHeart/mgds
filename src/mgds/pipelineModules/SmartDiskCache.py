@@ -651,13 +651,20 @@ class SmartDiskCache(
         """
         legacy = data.get("version", 0) < CACHE_VERSION
         self._migrate_legacy_index_in_place(data)
+        stamped, flagged = self._migrate_dedup_keys(data)
+        if flagged:
+            print(
+                f"SmartDiskCache ({self._status_label()}): {flagged} entries share a cache file with a sample of a "
+                "different pair/mask identity (same chosen image, different rejected image or mask); all but the "
+                "pair each file was built from are rebuilt into their own files on the next normal cache pass."
+            )
         interned = self._migrate_intern_sourceless_concepts(data)
         blanked = 0
         if not self.store_sourceless_prompts:
             blanked = self._blank_stored_prompts(data)
             if blanked:
                 self._disk_index_may_hold_prompts = True
-        if legacy or interned or recovered or blanked:
+        if legacy or interned or recovered or blanked or stamped or flagged:
             self._index_dirty = True
 
     @staticmethod
@@ -1015,6 +1022,148 @@ class SmartDiskCache(
         if resolution:
             return f"{hash12}_{resolution}"
         return hash12
+
+    @staticmethod
+    def _dedup_key(file_hash: str, sidecar_hashes: dict | None) -> str:
+        """Identity of what a cache file holds: the source bytes plus every
+        sidecar that feeds the cached tensors (a DPO pair's rejected image,
+        the chosen and rejected masks, ...).
+
+        Two samples may only share a .pt (dedup) and a cache_file name when
+        this key matches. Keying on the source hash alone let every pair with
+        the same chosen image collapse onto one file, so pairs with a
+        different rejected image or mask trained on another pair's tensors.
+        Without sidecars the key is the plain content hash, so single-image
+        caches keep exactly their old keys and file names.
+        """
+        if not sidecar_hashes:
+            return file_hash
+        h = xxhash.xxh64()
+        h.update(file_hash.encode("utf-8"))
+        for sidecar_hash in sorted(sidecar_hashes.values()):
+            h.update(b"|")
+            h.update(str(sidecar_hash).encode("utf-8"))
+        return h.hexdigest()
+
+    @classmethod
+    def _entry_dedup_key(cls, entry: dict) -> str:
+        key = entry.get("dedup_key")
+        if key:
+            return key
+        return cls._dedup_key(entry.get("hash", ""), entry.get("sidecar_hashes"))
+
+    @classmethod
+    def _migrate_dedup_keys(cls, idx: dict) -> int:
+        """Stamp ``dedup_key`` on every entry, rebuild ``hash_index`` on it and
+        flag entries whose cache file is shared with a sample of a different
+        key (``shared_file_conflict``).
+
+        Caches built before sidecars entered the key may hold one file for
+        several pairs that share a chosen image but not a rejected image or
+        mask; only one of them is the pair the file was actually built from.
+        The flag makes _validate_entry rebuild every other member of such a
+        group into its own file on the next normal cache pass (the holder is
+        recognised from the .pt's image_path and kept; no file is deleted)
+        and makes sourceless / trust mode refuse to serve them. Idempotent;
+        returns ``(entries stamped with a key, entries flagged)``.
+        """
+        entries = idx.get("entries")
+        if not isinstance(entries, dict):
+            return 0, 0
+        hash_index: dict[str, list[str]] = {}
+        by_cache_file: dict[str, list[str]] = {}
+        stamped = 0
+        for filepath, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            key = entry.get("dedup_key")
+            if not key:
+                key = entry["dedup_key"] = cls._dedup_key(entry.get("hash", ""), entry.get("sidecar_hashes"))
+                stamped += 1
+            hash_index.setdefault(key, []).append(filepath)
+            for cache_file in cls._iter_variant_cache_files(entry):
+                by_cache_file.setdefault(cache_file, []).append(filepath)
+        idx["hash_index"] = hash_index
+        flagged: set[str] = set()
+        for paths in by_cache_file.values():
+            if len(paths) < 2:
+                continue
+            # The bug: same source bytes, different sidecars, one file. Group
+            # the file's entries by source hash and flag every group whose
+            # members disagree on the dedup key (that is, on the sidecars).
+            by_source: dict[str, list[str]] = {}
+            for fp in paths:
+                by_source.setdefault(entries[fp].get("hash", ""), []).append(fp)
+            for same_source in by_source.values():
+                if len(same_source) > 1 and len({entries[fp]["dedup_key"] for fp in same_source}) > 1:
+                    flagged.update(same_source)
+        for filepath, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            if filepath in flagged:
+                entry["shared_file_conflict"] = True
+            else:
+                entry.pop("shared_file_conflict", None)
+        return stamped, len(flagged)
+
+    def _peek_pt_holder(self, cache_file: str) -> str | None:
+        """The source path a variant's first .pt was built from (its stamped
+        ``image_path``), read without touching the tensors; None when the file
+        is unreadable or carries no path. Memoised per cache file."""
+        memo = self.__dict__.setdefault("_pt_holder_memo", {})
+        if cache_file in memo:
+            return memo[cache_file]
+        holder = None
+        try:
+            data = torch.load(self._real_pt_path(cache_file, 0), weights_only=False, map_location="cpu", mmap=True)
+            value = data.get("image_path") if isinstance(data, dict) else None
+            if isinstance(value, str) and value:
+                holder = value
+        except Exception:  # noqa: BLE001 - an unreadable .pt simply has no known holder
+            holder = None
+        memo[cache_file] = holder
+        return holder
+
+    @staticmethod
+    def _same_source_path(a: str | None, b: str | None) -> bool:
+        if not a or not b:
+            return False
+        return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+    def _entry_holds_its_files(self, filepath: str, entry: dict) -> bool:
+        """True when every variant file of a conflict-flagged entry was built
+        from this entry's own source (the .pt's image_path is this path)."""
+        cache_files = list(self._iter_variant_cache_files(entry))
+        if not cache_files:
+            return False
+        return all(self._same_source_path(self._peek_pt_holder(cf), filepath) for cf in cache_files)
+
+    def _shared_file_victims(self, filepaths) -> list[str]:
+        """Among ``filepaths``, the conflict-flagged entries whose cache file
+        holds another sample's tensors. Holders are unflagged on the way."""
+        entries = self.cache_index.get("entries", {})
+        victims = []
+        for filepath in filepaths:
+            entry = entries.get(filepath)
+            if not isinstance(entry, dict) or not entry.get("shared_file_conflict"):
+                continue
+            if self._entry_holds_its_files(filepath, entry):
+                entry.pop("shared_file_conflict", None)
+                self._index_dirty = True
+            else:
+                victims.append(filepath)
+        return victims
+
+    def _refuse_shared_file_victims(self, filepaths, mode: str) -> None:
+        victims = self._shared_file_victims(filepaths)
+        if not victims:
+            return
+        raise RuntimeError(
+            f"{mode}: {len(victims)} pair entries in {self.cache_dir} share a cache file with a different pair "
+            "(same chosen image, different rejected image or mask) and would train on the other pair's "
+            "tensors. Run a normal cache pass with the source files present (skip cache validation OFF) to "
+            f"rebuild them into their own files. First: {os.path.basename(victims[0])}"
+        )
 
     @staticmethod
     def _resolution_key(resolution: str | None) -> str:
@@ -1445,16 +1594,22 @@ class SmartDiskCache(
                 file_hash = entry.get("hash")
                 if not file_hash:
                     continue
+                # Files are named by the dedup key (source + sidecars); entries
+                # built before sidecars entered the key still carry files named
+                # by the source hash alone, so try both.
+                name_keys = dict.fromkeys((self._entry_dedup_key(entry), file_hash))
                 for nk in new_keys:
                     if nk in variants:
                         continue
-                    cache_file = self._make_cache_file(
-                        file_hash,
-                        None if nk == NO_RESOLUTION_KEY else nk,
-                    )
-                    if f"{cache_file}_1.pt" in self._existing_pt_files:
-                        variants[nk] = {"cache_file": cache_file}
-                        reused += 1
+                    for name_key in name_keys:
+                        cache_file = self._make_cache_file(
+                            name_key,
+                            None if nk == NO_RESOLUTION_KEY else nk,
+                        )
+                        if f"{cache_file}_1.pt" in self._existing_pt_files:
+                            variants[nk] = {"cache_file": cache_file}
+                            reused += 1
+                            break
                     derived += 1
                 # Move newly-derived keys to the front so the "first
                 # variant" picks them, preserving any reused .pt links.
@@ -1615,6 +1770,18 @@ class SmartDiskCache(
                 f"cached as '{entry['modeltype']}', current model is '{self.modeltype}'. "
                 f"Delete the cache directory or use a separate cache_dir for this model type."
             )
+
+        if entry.get("shared_file_conflict"):
+            # Flagged on load: this entry's file is shared with a sample of a
+            # different pair/mask identity. The pair the file was built from
+            # keeps it; every other member rebuilds into its own file (the
+            # shared file is left in place for its holder).
+            if self._entry_holds_its_files(filepath, entry):
+                with self._index_lock:
+                    entry.pop("shared_file_conflict", None)
+                self._index_dirty = True
+            else:
+                return "content_changed"
 
         if current_mtime is None:
             if not self.tolerate_missing_source:
@@ -2481,28 +2648,36 @@ class SmartDiskCache(
         mtime: float,
         in_index: int,
         variations: int,
+        dedup_key: str | None = None,
+        sidecar_state: tuple[dict[str, float], dict[str, str]] | None = None,
     ) -> bool:
         """Reuse an existing entry's variant when content+resolution match.
 
-        Hash-index lookup finds entries built from the same source bytes; we
-        only dedup when one of those entries already has a variant at the
-        requested resolution key. Different resolution requests of the same
-        content are still allowed to share a single entry — we just register
-        an additional variant under a different key.
+        Hash-index lookup finds entries built from the same source bytes AND
+        the same sidecars (``dedup_key``; the plain content hash when the
+        cache has no sidecars); we only dedup when one of those entries
+        already has a variant at the requested resolution key. Different
+        resolution requests of the same content are still allowed to share a
+        single entry — we just register an additional variant under a
+        different key. An entry still flagged as sharing its file with a
+        different pair is never a donor: its file may hold the other pair.
         """
         key = self._resolution_key(resolution)
+        dedup_key = dedup_key or file_hash
         runtime_values_by_variation = (
             self._sourceless_runtime_values_by_variation(variations, in_index) if self.source_path_in_name else {}
         )
         with self._index_lock:
-            if file_hash not in self.cache_index["hash_index"]:
+            if dedup_key not in self.cache_index["hash_index"]:
                 return False
 
-            for existing_path in self.cache_index["hash_index"][file_hash]:
+            for existing_path in self.cache_index["hash_index"][dedup_key]:
                 existing_entry = self.cache_index["entries"].get(existing_path)
                 if existing_entry is None:
                     continue
                 if existing_entry["modeltype"] != self.modeltype:
+                    continue
+                if existing_entry.get("shared_file_conflict"):
                     continue
                 existing_variants = existing_entry.get("variants", {})
                 variant = existing_variants.get(key)
@@ -2512,12 +2687,13 @@ class SmartDiskCache(
 
                 target_entry = self.cache_index["entries"].get(filepath)
                 if target_entry is None:
-                    sidecar_mtimes, sidecar_hashes = self._compute_sidecar_state(
+                    sidecar_mtimes, sidecar_hashes = sidecar_state or self._compute_sidecar_state(
                         self._extra_paths_by_filepath.get(filepath, {})
                     )
                     target_entry = {
                         "filename": os.path.basename(filepath),
                         "hash": file_hash,
+                        "dedup_key": dedup_key,
                         "mtime": mtime,
                         "modeltype": self.modeltype,
                         "variants": {},
@@ -2533,6 +2709,8 @@ class SmartDiskCache(
                     self._store_row_runtime_values(target_entry, in_index, runtime_values_by_variation)
                     self.cache_index["entries"][filepath] = target_entry
                 else:
+                    target_entry["dedup_key"] = dedup_key
+                    target_entry.pop("shared_file_conflict", None)
                     target_entry["sourceless"] = self._sourceless_metadata(in_index, variations)
                     row = target_entry.setdefault("sourceless_rows", {}).setdefault(str(in_index), {})
                     row["metadata"] = target_entry["sourceless"]
@@ -2548,7 +2726,7 @@ class SmartDiskCache(
                 if existing_cr is not None:
                     dedup_variant["crop_resolution"] = existing_cr
                 target_entry["variants"][key] = dedup_variant
-                self._add_to_hash_index(file_hash, filepath)
+                self._add_to_hash_index(dedup_key, filepath)
                 return True
 
             return False
@@ -2799,8 +2977,18 @@ class SmartDiskCache(
                 return False
         return True
 
+    def _pt_built_from(self, cached: dict, filepath: str | None) -> bool:
+        """Whether a loaded .pt was built from ``filepath``. A .pt without a
+        stamped image_path (or no path to compare) is taken at its word, as
+        before; one stamped with another sample's path (a deduped twin) must
+        not lend that sample its concept."""
+        holder = cached.get("image_path") if isinstance(cached, dict) else None
+        if not isinstance(holder, str) or not holder or not filepath:
+            return True
+        return self._same_source_path(holder, filepath)
+
     def _sourceless_runtime_values_for_row(
-        self, entry: dict, in_index: int, variation: int, cached: dict
+        self, entry: dict, in_index: int, variation: int, cached: dict, filepath: str | None = None
     ) -> dict | None:
         source_indices = getattr(self, "_sourceless_source_indices", None)
         source_index = source_indices[in_index] if source_indices and in_index < len(source_indices) else in_index
@@ -2816,6 +3004,15 @@ class SmartDiskCache(
         if isinstance(runtime_values, dict):
             return self._attach_interned_concept(runtime_values, entry)
 
+        # Last resort, the values baked into the .pt: only when the .pt is
+        # this entry's own. A deduped twin's would hand this sample the
+        # other pair's concept (its beta, loss weight, type), silently.
+        if not self._pt_built_from(cached, filepath):
+            raise RuntimeError(
+                f"Sourceless training: cache entry for '{filepath}' carries no runtime values of its own and its "
+                f"cache file was built from '{cached.get('image_path')}', so its concept cannot be served. "
+                "Run a normal cache pass (skip cache validation OFF) to stamp the entry's own values."
+            )
         runtime_values = cached.get("__sourceless_values")
         return runtime_values if isinstance(runtime_values, dict) else None
 
@@ -3028,8 +3225,14 @@ class SmartDiskCache(
         in_index: int,
         variations: int,
         current_device,
+        dedup_key: str | None = None,
+        sidecar_state: tuple[dict[str, float], dict[str, str]] | None = None,
     ):
-        cache_file = self._make_cache_file(file_hash, resolution)
+        # The file is named after what it holds: source bytes plus sidecars
+        # (see _dedup_key), so pairs that share a chosen image but not a
+        # rejected image or mask never write into one another's file.
+        dedup_key = dedup_key or file_hash
+        cache_file = self._make_cache_file(dedup_key, resolution)
         required_schema = set(self.split_names) | set(self.aggregate_names)
 
         # Capture the actual stored crop_resolution (from either the
@@ -3124,7 +3327,9 @@ class SmartDiskCache(
                 self._existing_pt_files.add(pt_name)
             self._register_content_pt(content_hash, pt_name)
 
-        sidecar_mtimes, sidecar_hashes = self._compute_sidecar_state(self._extra_paths_by_filepath.get(filepath, {}))
+        sidecar_mtimes, sidecar_hashes = sidecar_state or self._compute_sidecar_state(
+            self._extra_paths_by_filepath.get(filepath, {})
+        )
         runtime_values_by_variation = (
             self._sourceless_runtime_values_by_variation(variations, in_index) if self.source_path_in_name else {}
         )
@@ -3168,6 +3373,7 @@ class SmartDiskCache(
                 entry = {
                     "filename": os.path.basename(filepath),
                     "hash": file_hash,
+                    "dedup_key": dedup_key,
                     "mtime": mtime,
                     "modeltype": self.modeltype,
                     "variants": {},
@@ -3194,6 +3400,8 @@ class SmartDiskCache(
                 # Refresh metadata; the source content may have changed and
                 # been re-hashed since this entry was first created.
                 entry["hash"] = file_hash
+                entry["dedup_key"] = dedup_key
+                entry.pop("shared_file_conflict", None)
                 entry["mtime"] = mtime
                 entry["modeltype"] = self.modeltype
                 entry["cache_version"] = CACHE_VERSION
@@ -3233,7 +3441,7 @@ class SmartDiskCache(
                 except (TypeError, ValueError):
                     pass
             entry["variants"][key] = variant_record
-            self._add_to_hash_index(file_hash, filepath)
+            self._add_to_hash_index(dedup_key, filepath)
 
     def _get_source_path(self, in_variation: int, in_index: int) -> str | None:
         if self.source_path_in_name:
@@ -3316,6 +3524,15 @@ class SmartDiskCache(
             with self._index_lock:
                 entry["sidecar_mtimes"] = mtimes
                 entry["sidecar_hashes"] = hashes
+                # The sidecars are part of the dedup identity: re-key the entry
+                # now that they are known, so no later sample dedups onto it
+                # by the source hash alone.
+                old_key = self._entry_dedup_key(entry)
+                new_key = self._dedup_key(entry.get("hash", ""), hashes)
+                if new_key != old_key:
+                    self._remove_from_hash_index(old_key, filepath)
+                    self._add_to_hash_index(new_key, filepath)
+                entry["dedup_key"] = new_key
             self._index_dirty = True
             return True
 
@@ -3462,6 +3679,9 @@ class SmartDiskCache(
                     f"current model is '{self.modeltype}'. "
                     f"Change your cache directory or rebuild the cache."
                 )
+        # Entries whose file holds a different pair must never be served
+        # silently; without the sources there is nothing to rebuild from.
+        self._refuse_shared_file_victims(list(self.cache_index["entries"]), "Sourceless training")
 
         state = self._state.sourceless_cache_state
         entries = self.cache_index["entries"]
@@ -3757,6 +3977,9 @@ class SmartDiskCache(
                         f"cached as '{entry.get('modeltype')}', current model is '{self.modeltype}'. "
                         f"Delete the cache directory or use a separate cache_dir for this model type."
                     )
+            # Trust mode skips the validation that would rebuild them: refuse
+            # entries whose file holds a different pair instead of serving it.
+            self._refuse_shared_file_victims(required_filepaths, "Trust mode")
 
         # --- Variant-aware session skip (multi-resolution) ---
         # The filepath-granular skip above is bypassed under multi-resolution
@@ -3824,6 +4047,11 @@ class SmartDiskCache(
             and not bucket_drift
             and (not multi_target or adaptive_single_target)
             and self.cache_index.get("entries")
+            # Entries flagged on load as sharing their file with a different
+            # pair must reach _validate_entry, which rebuilds them.
+            and not any(
+                (self.cache_index["entries"].get(fp) or {}).get("shared_file_conflict") for fp in required_filepaths
+            )
             and self._fast_validate(required_filepaths, self._role_validation_token(role_sig, dataset_digest))
         ):
             all_in_index = all(fp in self.cache_index["entries"] for fp in required_filepaths)
@@ -4034,7 +4262,7 @@ class SmartDiskCache(
                         # itself changed, every variant is stale. Drop the
                         # entry.
                         with self._index_lock:
-                            old_hash = entry.get("hash")
+                            old_hash = self._entry_dedup_key(entry)
                             if old_hash:
                                 self._remove_from_hash_index(old_hash, filepath)
                             if filepath in self.cache_index["entries"]:
@@ -4156,7 +4384,22 @@ class SmartDiskCache(
                         except OSError:
                             return filepath, "hash_failed"
 
-                    if self._try_dedup(filepath, file_hash, resolution, mtime, in_index, variations):
+                    # Sidecars (a pair's rejected image, masks) are hashed once
+                    # here: they are part of the identity the file is named and
+                    # deduped by, and the entry records their state.
+                    sidecar_state = self._compute_sidecar_state(self._extra_paths_by_filepath.get(filepath, {}))
+                    dedup_key = self._dedup_key(file_hash, sidecar_state[1])
+
+                    if self._try_dedup(
+                        filepath,
+                        file_hash,
+                        resolution,
+                        mtime,
+                        in_index,
+                        variations,
+                        dedup_key=dedup_key,
+                        sidecar_state=sidecar_state,
+                    ):
                         entry = self.cache_index["entries"][filepath]
                         key = self._resolution_key(resolution)
                         variant = entry.get("variants", {}).get(key)
@@ -4177,6 +4420,8 @@ class SmartDiskCache(
                             in_index,
                             variations,
                             current_device,
+                            dedup_key=dedup_key,
+                            sidecar_state=sidecar_state,
                         )
                     except Exception as e:
                         return filepath, f"build_failed: {e}"
@@ -4678,6 +4923,15 @@ class SmartDiskCache(
                     for name in self.aggregate_names:
                         if name in cached:
                             agg_data[name] = cached[name]
+                    source_name = getattr(self, "source_path_in_name", None)
+                    if (
+                        source_name
+                        and source_name in agg_data
+                        and not self._same_source_path(agg_data[source_name], filepath)
+                    ):
+                        # A deduped .pt stamps its builder's path; serve this
+                        # entry's own, as _try_synthesize_aggregate does.
+                        agg_data[source_name] = filepath
                     if agg_data:
                         # Key by (filepath, variation, in_index): the same
                         # filepath can appear at multiple in_index values
@@ -4971,6 +5225,12 @@ class SmartDiskCache(
                         item[name] = cached[name]
                     else:
                         missing_for_file.append(name)
+                source_name = getattr(self, "source_path_in_name", None)
+                if source_name and source_name in item and not self._same_source_path(item[source_name], filepath):
+                    # A deduped .pt stamps the path of the sample it was built
+                    # from; the served path is this entry's own identity (as
+                    # the aggregate fast path already serves it).
+                    item[source_name] = filepath
                 if missing_for_file:
                     # The schema-drift pass should have populated these, but a
                     # per-file augmentation failure (or a stale .pt that
@@ -5013,11 +5273,13 @@ class SmartDiskCache(
                             else:
                                 item[name] = sval
                 if self.sourceless:
-                    runtime_values = self._sourceless_runtime_values_for_row(cache_entry, in_index, variation, cached)
+                    runtime_values = self._sourceless_runtime_values_for_row(
+                        cache_entry, in_index, variation, cached, filepath
+                    )
                     if isinstance(runtime_values, dict):
                         for name, value in runtime_values.items():
                             item.setdefault(name, value)
-                if self.sourceless and "__concept_loss_weight" in cached:
+                if self.sourceless and "__concept_loss_weight" in cached and self._pt_built_from(cached, filepath):
                     item.setdefault(
                         "concept",
                         {
@@ -5124,6 +5386,7 @@ class SmartDiskCache(
             index = json.load(f)
 
         SmartDiskCache._migrate_legacy_index_in_place(index)
+        SmartDiskCache._migrate_dedup_keys(index)
         entries = index.get("entries", {})
         hash_index = index.get("hash_index", {})
 
@@ -5137,7 +5400,7 @@ class SmartDiskCache(
 
         for fp in dead_filepaths:
             entry = entries.pop(fp)
-            file_hash = entry.get("hash", "")
+            file_hash = SmartDiskCache._entry_dedup_key(entry)
             if file_hash in hash_index:
                 paths = hash_index[file_hash]
                 if fp in paths:
