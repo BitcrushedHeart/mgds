@@ -1154,6 +1154,70 @@ class SmartDiskCache(
                 victims.append(filepath)
         return victims
 
+    def _rename_legacy_sidecar_files(self) -> int:
+        """Give every legacy, source-hash-named file whose holder has sidecars
+        the name its holder's dedup key now dictates.
+
+        Before sidecars entered the key, a pair's file was ``<source12>_<res>``.
+        A later twin WITHOUT sidecars has that very name as its own (its key is
+        the source hash), so rebuilding it would only re-link to, or overwrite,
+        the holder's file and the conflict could never resolve. Renaming the
+        holder's file (metadata-only, no tensor I/O, index updated in step)
+        frees the name; the twin then builds into it on this same pass. A file
+        referenced by several entries moves only when the entry it was built
+        from (its stamped image_path) is the one with sidecars; the others
+        keep a dangling link and are rebuilt by validation. Nothing is ever
+        overwritten: a name already taken is left alone. Files named by a
+        no-sidecar entry's source hash are their own name already, so
+        single-image caches are untouched. Returns the number of files moved.
+        """
+        entries = self.cache_index.get("entries") or {}
+        referencing: dict[str, list[str]] = {}
+        for filepath, entry in entries.items():
+            for cache_file in self._iter_variant_cache_files(entry):
+                referencing.setdefault(cache_file, []).append(filepath)
+        moved = 0
+        for filepath, entry in entries.items():
+            if entry.get("modeltype") != self.modeltype:
+                continue
+            dedup_key = self._entry_dedup_key(entry)
+            source_hash = entry.get("hash", "")
+            if not source_hash or dedup_key == source_hash:
+                continue
+            for key, variant in list((entry.get("variants") or {}).items()):
+                cache_file = variant.get("cache_file")
+                resolution = None if key == NO_RESOLUTION_KEY else key
+                if not cache_file or cache_file != self._make_cache_file(source_hash, resolution):
+                    continue
+                new_cache_file = self._make_cache_file(dedup_key, resolution)
+                if f"{cache_file}_1.pt" not in self._existing_pt_files:
+                    continue
+                others = [fp for fp in referencing.get(cache_file, []) if fp != filepath]
+                if others and not self._same_source_path(self._peek_pt_holder(cache_file), filepath):
+                    continue  # a twin built this file; this entry is a victim and rebuilds
+                names = []
+                v = 0
+                while f"{cache_file}_{v + 1}.pt" in self._existing_pt_files:
+                    names.append((f"{cache_file}_{v + 1}.pt", f"{new_cache_file}_{v + 1}.pt"))
+                    v += 1
+                if any(new in self._existing_pt_files for _, new in names):
+                    continue  # never overwrite a file another entry may reference
+                for old, new in names:
+                    _replace_retrying(os.path.join(self._real_cache_dir, old), os.path.join(self._real_cache_dir, new))
+                    self._existing_pt_files.discard(old)
+                    self._existing_pt_files.add(new)
+                with self._index_lock:
+                    variant["cache_file"] = new_cache_file
+                    if not others:
+                        entry.pop("shared_file_conflict", None)
+                self.__dict__.setdefault("_pt_holder_memo", {}).pop(cache_file, None)
+                self._index_dirty = True
+                moved += 1
+        if moved:
+            self._status(f"moved {moved} legacy cache files to their sidecar-aware names")
+            self._save_cache_index()
+        return moved
+
     def _refuse_shared_file_victims(self, filepaths, mode: str) -> None:
         victims = self._shared_file_victims(filepaths)
         if not victims:
@@ -3272,6 +3336,21 @@ class SmartDiskCache(
                     existing = torch.load(real_pt, weights_only=False, map_location="cpu")
                 except Exception:
                     existing = None
+                if isinstance(existing, dict) and not self._pt_built_from(existing, filepath):
+                    # The file on disk under this entry's name was built from
+                    # another sample. It is only ours to reuse when that
+                    # sample is a twin of the same identity (same dedup key);
+                    # a legacy file of a sidecar twin would otherwise hand us
+                    # its rejected latent or mask again, and must never be
+                    # overwritten while that twin still references it.
+                    holder = self.cache_index["entries"].get(os.path.normpath(existing.get("image_path", "")))
+                    if holder is None or self._entry_dedup_key(holder) != dedup_key:
+                        raise RuntimeError(
+                            f"Cache file {pt_name} belongs to '{existing.get('image_path')}' (a different "
+                            f"pair/mask identity) and cannot be reused or overwritten for '{filepath}'. "
+                            "Run a normal cache pass with skip cache validation OFF, which moves such legacy "
+                            "files to their sidecar-aware names first."
+                        )
                 if isinstance(existing, dict):
                     existing_keys = {k for k in existing if not k.startswith("__")}
                     if required_schema.issubset(existing_keys):
@@ -4014,6 +4093,13 @@ class SmartDiskCache(
         # Single os.scandir of the cache dir — used by fast and full paths.
         self._status("scanning existing cache tensors")
         self._existing_pt_files = self._scan_existing_pt_files()
+
+        # Legacy files named by the source hash alone but built from an entry
+        # with sidecars move to that entry's dedup-key name, so a twin without
+        # sidecars (whose own name IS the source-hash name) can be built
+        # into a file of its own instead of re-linking to the holder's.
+        if not skip_validation:
+            self._rename_legacy_sidecar_files()
 
         # Bucket-method drift recovery: aspect-math derives new variant keys
         # from cached resolutions and links any pre-existing .pt files. Pure
