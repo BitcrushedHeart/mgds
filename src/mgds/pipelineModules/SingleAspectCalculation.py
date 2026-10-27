@@ -148,6 +148,13 @@ class SingleAspectCalculation(
     def bucket_for_aspect(self, aspect: float, target_resolution: int) -> tuple[int, int]:
         return target_resolution, target_resolution
 
+    def reconstruct_bucket_resolutions(self, target_resolution: int) -> list[tuple[int, int]]:
+        """Bucket grid for ``target_resolution`` without ``start()`` (see AspectBucketing)."""
+        return [(int(target_resolution), int(target_resolution))]
+
+    def reconstruct_bucket_for_aspect(self, aspect: float, target_resolution: int) -> tuple[int, int]:
+        return int(target_resolution), int(target_resolution)
+
     def compute_bucket_method_hash(self) -> str:
         payload = {
             "method": "single_aspect_v2_adaptive" if self.adaptive_resolution else "single_aspect_v1_no_upscale",

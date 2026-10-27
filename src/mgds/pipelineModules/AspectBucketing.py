@@ -240,6 +240,37 @@ class AspectBucketing(
         bucket_index = np.argmin(abs(self.bucket_aspects[target_resolution] - aspect))
         return self.bucket_resolutions[target_resolution][bucket_index]
 
+    def _reconstructed_target_buckets(self, target_resolution: int) -> tuple[list[tuple[int, int]], np.ndarray]:
+        # Kept apart from bucket_resolutions: SmartDiskCache treats a
+        # populated bucket_resolutions as a started module, and a sourceless
+        # run must stay on its own path.
+        reconstructed = self.__dict__.setdefault("_reconstructed_buckets", {})
+        target_resolution = int(target_resolution)
+        buckets = reconstructed.get(target_resolution)
+        if buckets is None:
+            resolutions, aspects = self.__create_automatic_buckets([target_resolution])
+            buckets = (resolutions[target_resolution], np.array(aspects[target_resolution]))
+            reconstructed[target_resolution] = buckets
+        return buckets
+
+    def reconstruct_bucket_resolutions(self, target_resolution: int) -> list[tuple[int, int]]:
+        """Bucket grid ``start()`` builds for ``target_resolution``, without ``start()``.
+
+        A target's grid depends only on the target and the quantization and is
+        built by the same code in the same order, so the result (including the
+        order, which breaks ``bucket_for_aspect`` ties) equals a started
+        module's ``bucket_resolutions[target_resolution]``. Sourceless
+        SmartDiskCache runs never start this module and use it to tell which
+        tier a cached bucket belongs to.
+        """
+        return list(self._reconstructed_target_buckets(target_resolution)[0])
+
+    def reconstruct_bucket_for_aspect(self, aspect: float, target_resolution: int) -> tuple[int, int]:
+        """``bucket_for_aspect`` against the reconstructed grid; needs no ``start()``."""
+        resolutions, aspects = self._reconstructed_target_buckets(target_resolution)
+        bucket_index = np.argmin(abs(aspects - aspect))
+        return resolutions[bucket_index]
+
     def compute_bucket_method_hash(self) -> str:
         """Hash of the post-start() bucketing config.
 

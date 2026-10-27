@@ -15,6 +15,7 @@ from typing import Any
 from mgds.PipelineModule import PipelineModule
 from mgds.pipelineModules.ResolutionPolicy import (
     ADAPTIVE_MIN_RESOLUTION,
+    all_resolutions_cover_scale,
     nominal_resolution_for_crop,
     parse_adaptive_resolution_ladder,
     scale_resolution_for_crop,
@@ -2345,14 +2346,84 @@ class SmartDiskCache(
                 return variant
         return None
 
+    def _capped_adaptive_tiers(self, maximum: int | None) -> list[int]:
+        """Adaptive tiers an entry stamped with ``maximum`` may train at, ascending.
+
+        Equals the tier list AspectBucketing derives from the item's own target
+        spec: that spec's maximum plus every ladder value at or below it.
+        """
+        if maximum is None:
+            return []
+        try:
+            return target_resolutions_for_spec(
+                str(int(maximum)),
+                True,
+                getattr(self, "adaptive_resolution_ladder", None),
+            )
+        except (TypeError, ValueError):
+            return []
+
+    def _reconstructed_tier_buckets(self, tiers: list[int]) -> dict[int, set[tuple[int, int]]]:
+        """Bucket grid per tier from an unstarted bucketing module; {} if unavailable."""
+        reconstruct = getattr(getattr(self, "aspect_bucketing", None), "reconstruct_bucket_resolutions", None)
+        if reconstruct is None:
+            return {}
+        try:
+            return {tier: {(int(h), int(w)) for h, w in reconstruct(tier)} for tier in tiers}
+        except Exception:
+            return {}
+
+    def _reconstructed_adaptive_variants(
+        self,
+        entry: dict,
+        variants: list[tuple[str, dict]],
+        source_resolution: tuple[int, int],
+        all_source_resolutions: list,
+    ) -> list[tuple[str, dict]]:
+        """Sourceless twin of the started-AspectBucketing branch.
+
+        Rebuilds the bucket the item's own tiers (capped by its stamped
+        maximum) assign to its aspect, applies the same no-upscale eligibility
+        with the smallest-tier fallback, and keeps the cached variant with that
+        exact key. Returns [] when the bucketing module can't reconstruct its
+        grid or that variant isn't cached; the caller then falls back to the
+        crop-resolution rules.
+        """
+        reconstruct = getattr(getattr(self, "aspect_bucketing", None), "reconstruct_bucket_for_aspect", None)
+        if reconstruct is None:
+            return []
+        tiers = self._capped_adaptive_tiers(
+            entry.get("adaptive_max_resolution", getattr(self, "adaptive_resolution_max", None))
+        )
+        if not tiers:
+            return []
+        try:
+            aspect = source_resolution[0] / source_resolution[1]
+            eligible = [
+                tier
+                for tier in tiers
+                if all_resolutions_cover_scale(
+                    all_source_resolutions,
+                    scale_resolution_for_crop(source_resolution, reconstruct(aspect, tier)),
+                )
+            ]
+            bucket_h, bucket_w = reconstruct(aspect, max(eligible) if eligible else min(tiers))
+        except Exception:
+            return []
+        key = f"{bucket_h}x{bucket_w}"
+        return [(variant_key, value) for variant_key, value in variants if variant_key == key]
+
     def _training_eligible_variants(self, entry: dict) -> list[tuple[str, dict]]:
         """Cached variants this source may train at without an upscale.
 
         Sourced runs use the live AspectBucketing target map, which also lets
         us reject every variant if the required smallest-tier fallback is
-        absent.  Sourceless runs have no started bucketing module, so they
-        recover the same rule from the stamped original/crop resolutions and
-        fall back to the smallest cached tier when the source fits none.
+        absent.  Sourceless runs have no started bucketing module: in adaptive
+        mode they rebuild the bucket grid from the unstarted module and pick
+        the same variant a sourced run would; otherwise (or when that variant
+        isn't cached) they recover the rule from the stamped original/crop
+        resolutions and fall back to the smallest cached tier when the source
+        fits none.
         """
         variants = [(key, value) for key, value in (entry.get("variants") or {}).items() if value.get("cache_file")]
         if not variants:
@@ -2404,6 +2475,12 @@ class SmartDiskCache(
                 # Preserve compatibility with third-party bucketing modules;
                 # the crop-resolution path below provides the same guard.
                 pass
+        elif adaptive_enabled:
+            selected = self._reconstructed_adaptive_variants(
+                entry, variants, (source_h, source_w), all_source_resolutions
+            )
+            if selected:
+                return selected
 
         parsed: list[tuple[str, dict, int, int]] = []
         for key, value in variants:
@@ -2430,7 +2507,21 @@ class SmartDiskCache(
                 fitting.append((key, value, crop_h, crop_w))
         maximum = entry.get("adaptive_max_resolution", getattr(self, "adaptive_resolution_max", None))
         if maximum is not None:
-            fitting = [item for item in fitting if nominal_resolution_for_crop((item[2], item[3])) <= maximum + 1]
+            # Quantized buckets of a tier can exceed its nominal size (the 768
+            # tier's 640x960 is 784 nominal), so tier membership also counts.
+            capped_buckets = set().union(
+                *self._reconstructed_tier_buckets(self._capped_adaptive_tiers(maximum)).values()
+            )
+
+            def within_maximum(value: dict, crop_h: int, crop_w: int) -> bool:
+                if nominal_resolution_for_crop((crop_h, crop_w)) <= maximum + 1:
+                    return True
+                if (crop_h, crop_w) in capped_buckets:
+                    return True
+                stamped_target = value.get("target_resolution")
+                return isinstance(stamped_target, int) and stamped_target <= maximum
+
+            fitting = [item for item in fitting if within_maximum(item[1], item[2], item[3])]
         if fitting:
             if adaptive_enabled:
                 largest = max(nominal_resolution_for_crop((h, w)) for _, _, h, w in fitting)
@@ -2459,8 +2550,11 @@ class SmartDiskCache(
                     )
             except (TypeError, ValueError):
                 adaptive_floor = ADAPTIVE_MIN_RESOLUTION
+            floor_buckets = self._reconstructed_tier_buckets([adaptive_floor]).get(adaptive_floor, set())
             floor_variants = [
-                (key, value) for key, value, _, _ in parsed if value.get("target_resolution") == adaptive_floor
+                (key, value)
+                for key, value, crop_h, crop_w in parsed
+                if value.get("target_resolution") == adaptive_floor or (crop_h, crop_w) in floor_buckets
             ]
             if floor_variants:
                 return floor_variants
