@@ -25,6 +25,7 @@ from mgds.pipelineModuleTypes.SingleVariationRandomAccessPipelineModule import S
 import torch
 
 import xxhash
+from PIL import Image
 from tqdm import tqdm
 
 CACHE_VERSION = 3
@@ -53,6 +54,47 @@ NO_RESOLUTION_KEY = "_"
 # loop defers it and a parallel pass fills these in before the build phase
 # groups items by target resolution.
 RESOLUTION_PENDING = object()
+
+# Formats whose decoded size read_header_resolution can predict from the
+# header. LoadImage decodes these with torchvision, which applies EXIF
+# orientation to JPEG and PNG only; anything torchvision rejects falls back to
+# Pillow's exif_transpose, which applies it to every format.
+HEADER_RESOLUTION_FORMATS = {"JPEG", "MPO", "PNG", "WEBP"}
+EXIF_ORIENTED_FORMATS = {"JPEG", "MPO", "PNG"}
+EXIF_ORIENTATION_TAG = 0x0112
+
+
+def read_header_resolution(path: str) -> tuple[int, int] | None:
+    """(height, width) LoadImage will decode ``path`` to, from its header alone.
+
+    Returns None whenever the header can't pin that down exactly (unsupported
+    or animated formats, a WebP carrying an EXIF rotation that only the
+    Pillow fallback would apply), so the caller decodes instead.
+    """
+    try:
+        with Image.open(path) as image:
+            image_format = image.format
+            if image_format not in HEADER_RESOLUTION_FORMATS:
+                return None
+            # MPO's extra frames are previews; torchvision decodes the first.
+            if image_format != "MPO" and getattr(image, "is_animated", False):
+                return None
+            width, height = image.size
+            # info["exif"] is what the header parse already found; getexif()
+            # would decode a PNG to look for a trailing eXIf chunk.
+            exif_data = image.info.get("exif")
+        orientation = None
+        if exif_data:
+            exif = Image.Exif()
+            exif.load(exif_data)
+            orientation = exif.get(EXIF_ORIENTATION_TAG)
+    except Exception:
+        return None
+    rotated = orientation in (5, 6, 7, 8)
+    if rotated and image_format not in EXIF_ORIENTED_FORMATS:
+        return None
+    return (width, height) if rotated else (height, width)
+
 
 # Aggregate names whose value at load time can be reconstructed from cache
 # metadata (variant key + entry filepath) without reading the .pt. When every
@@ -133,6 +175,8 @@ class SmartDiskCache(
         adaptive_resolution_ladder: str | list[int] | None = None,
         store_sourceless_prompts: bool = True,
         scrub_split_names: list[str] | None = None,
+        header_resolution_path_in_names: dict[str, str] | None = None,
+        header_resolution_blocked_in_names: list[str] | None = None,
     ):
         super().__init__()
         self.cache_dir = cache_dir
@@ -266,6 +310,16 @@ class SmartDiskCache(
         # (thread-local per-module item caches), and the encoder modules
         # serialize their forwards internally, so extra walkers are safe.
         self.build_max_workers = build_max_workers
+
+        # Resolution name -> path name (e.g. original_resolution ->
+        # image_path) for resolving a new item's variant key from its source
+        # files' headers instead of decoding them through the upstream chain.
+        # Only valid while nothing between the image load and its CalcAspect
+        # changes the size; ``header_resolution_blocked_in_names`` are
+        # per-item flags (e.g. a size-changing augmentation's enable setting)
+        # that send the item down the full walk when truthy.
+        self.header_resolution_path_in_names = header_resolution_path_in_names or {}
+        self.header_resolution_blocked_in_names = header_resolution_blocked_in_names or []
 
         # Additional per-sample sidecar in-name fields whose resolved paths
         # should be watched alongside ``source_path_in_name``. Touching one of
@@ -1016,6 +1070,53 @@ class SmartDiskCache(
         if res is not None:
             return f"{res[0]}x{res[1]}"
         return None
+
+    def _header_resolution_string(self, in_variation: int, in_index: int) -> tuple[str, dict] | None:
+        """A new item's variant key from its source files' headers.
+
+        Feeds the header sizes to ``_fast_resolution_string`` as if they were
+        the build's stamped source resolutions, so the key is the one
+        validation will expect for that item. Returns ``(key,
+        source_resolutions)`` or None to fall back to ``_get_resolution_string``
+        (no header config, a blocking flag set, a header that can't be read).
+        """
+        if not self.header_resolution_path_in_names or self.aspect_bucketing is None:
+            return None
+        if getattr(self.aspect_bucketing, "frame_dim_enabled", False):
+            return None
+        needed = ["original_resolution", *self.additional_resolution_in_names]
+        if any(name not in self.header_resolution_path_in_names for name in needed):
+            return None
+
+        variation = self.current_variation if self.current_variation >= 0 else in_variation
+        source_resolutions = {}
+        try:
+            for name in self.header_resolution_blocked_in_names:
+                if self._get_previous_item(variation, name, in_index):
+                    return None
+            for name in needed:
+                path = self._get_previous_item(variation, self.header_resolution_path_in_names[name], in_index)
+                resolution = read_header_resolution(path) if path else None
+                if resolution is None:
+                    return None
+                source_resolutions[name] = list(resolution)
+        except Exception:
+            return None
+
+        entry = {
+            "original_resolution": source_resolutions["original_resolution"],
+            "source_resolutions": source_resolutions,
+        }
+        key = self._fast_resolution_string(entry, in_variation, in_index)
+        if key is None:
+            return None
+        return key, source_resolutions
+
+    def _resolve_new_item(self, in_variation: int, in_index: int) -> tuple[str | None, dict | None]:
+        header = self._header_resolution_string(in_variation, in_index)
+        if header is not None:
+            return header
+        return self._get_resolution_string(in_variation, in_index), None
 
     def _make_cache_file(self, full_hash: str, resolution: str | None) -> str:
         hash12 = self._hash_to_filename(full_hash)
@@ -4202,6 +4303,7 @@ class SmartDiskCache(
         files_built = 0
         files_skipped = 0
         files_failed = []
+        header_mismatches = []
         self._status("validating cache entries")
 
         for group_key in self.group_variations:
@@ -4380,14 +4482,18 @@ class SmartDiskCache(
                     bar.update(1)
 
             # Parallel resolve pass: fill in the resolutions the loop above
-            # deferred. Each resolve repeats exactly the upstream walk the
-            # serial code used to run inline — same variation and index, so
-            # the per-index seeded RNG lands on the same bucket — but the
-            # walk decodes the source image, so it's fanned out across
-            # threads instead of serializing one decode per item. No
+            # deferred. Where the source headers give the exact decoded size
+            # (_header_resolution_string), the key comes from those without a
+            # decode; otherwise each resolve repeats exactly the upstream walk
+            # the serial code used to run inline — same variation and index,
+            # so the per-index seeded RNG lands on the same bucket — fanned
+            # out across threads since the walk decodes the source image. No
             # ``_target_override`` is held here, matching the old inline
             # behaviour where each item picks its own epoch-rotated target.
             pending = [ii for ii, item in items_to_build_by_index.items() if item[6] is RESOLUTION_PENDING]
+            # in_index -> header-read source resolutions, checked against the
+            # decoded sizes the build stamps.
+            header_estimates: dict[int, dict] = {}
             if pending:
                 resolve_workers = max(4, min(16, os.cpu_count() or 8))
                 with (
@@ -4395,11 +4501,13 @@ class SmartDiskCache(
                     tqdm(total=len(pending), smoothing=0.1, desc="resolving new items") as resolve_bar,
                 ):
                     future_to_index = {
-                        resolve_pool.submit(self._get_resolution_string, out_variation, ii): ii for ii in pending
+                        resolve_pool.submit(self._resolve_new_item, out_variation, ii): ii for ii in pending
                     }
                     for future in concurrent.futures.as_completed(future_to_index):
                         ii = future_to_index[future]
-                        resolution = future.result()
+                        resolution, estimate = future.result()
+                        if estimate is not None:
+                            header_estimates[ii] = estimate
                         item = items_to_build_by_index[ii]
                         self._active_key_by_filepath[item[0]] = self._resolution_key(resolution)
                         items_to_build_by_index[ii] = item[:6] + (resolution,)
@@ -4447,7 +4555,15 @@ class SmartDiskCache(
             ):
 
                 def fn(
-                    filepath, group_key, in_variation, in_index, group_index, variations, resolution, current_device
+                    filepath,
+                    group_key,
+                    in_variation,
+                    in_index,
+                    group_index,
+                    variations,
+                    resolution,
+                    current_device,
+                    header_estimates=header_estimates,
                 ):
                     if torch.cuda.is_available() and current_device is not None:
                         torch.cuda.set_device(current_device)
@@ -4512,6 +4628,14 @@ class SmartDiskCache(
                     except Exception as e:
                         return filepath, f"build_failed: {e}"
 
+                    estimate = header_estimates.get(in_index)
+                    if estimate is not None:
+                        stamped = (self.cache_index["entries"].get(filepath) or {}).get("source_resolutions") or {}
+                        for name, header_resolution in estimate.items():
+                            decoded = stamped.get(name)
+                            if decoded is not None and list(decoded) != header_resolution:
+                                header_mismatches.append((filepath, name, header_resolution, list(decoded)))
+
                     return filepath, "built"
 
                 current_device = torch.cuda.current_device() if torch.cuda.is_available() else None
@@ -4530,6 +4654,14 @@ class SmartDiskCache(
                     resolution_str = item[6]
                     target = self._target_int_for_resolution_key(resolution_str)
                     target_groups.setdefault(target, []).append(item)
+
+                # Submit each group bucket by bucket: the pool runs items in
+                # submission order, so concurrent workers then encode images of
+                # one shape, which a batching encoder (EncodeVAE's collector)
+                # can stack. Nothing depends on build order: workers already
+                # complete items in arbitrary order.
+                for group_items in target_groups.values():
+                    group_items.sort(key=lambda item: (item[6] or "", item[3]))
 
                 for target, group_items in target_groups.items():
                     prev_override = None
@@ -4586,6 +4718,19 @@ class SmartDiskCache(
                     finally:
                         if ab is not None and target is not None:
                             ab._target_override = prev_override
+
+        if header_mismatches:
+            # The build keyed these by a header size the decode disagreed with.
+            # Their .pt files and stamps hold the decoded truth, so the next
+            # validation computes the right key and rebuilds that variant.
+            examples = "; ".join(
+                f"'{fp}' {name} header {h[0]}x{h[1]} vs decoded {d[-2]}x{d[-1]}"
+                for fp, name, h, d in header_mismatches[:3]
+            )
+            print(
+                f"Warning: {len(header_mismatches)} image header size(s) disagreed with the decoded size; "
+                f"those entries are rebuilt on the next cache validation. {examples}"
+            )
 
         if not skip_validation:
             # No unconditional re-stamp here: entries (re)built or deduped this

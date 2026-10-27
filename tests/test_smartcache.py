@@ -28,6 +28,7 @@ import torch
 
 import pytest
 import xxhash
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -4304,13 +4305,17 @@ def _build_adaptive_pipeline(
     ladder: str = ADAPTIVE_LADDER,
     target: str = "512",
     trust_cache: bool = False,
+    cache_subdir: str = "cache",
+    extra_data: dict | None = None,
+    **cache_kwargs,
 ):
     """Mirror OneTrainer's adaptive image-cache wiring on tmp_path/'cache'.
 
     ``role='sft'`` is the main loader (rlhf off). ``role='dpo'`` is the DPO
     add-on loader: an extra rejected latent, the rejected source resolution
     constraining the adaptive tier, and the rejected image watched as a
-    sidecar. Returns (ds, cache_module, upstream_module).
+    sidecar. ``extra_data`` adds upstream columns and ``cache_kwargs`` extra
+    SmartDiskCache arguments. Returns (ds, cache_module, upstream_module).
     """
     n = len(sources["paths"])
     dpo = role == "dpo"
@@ -4327,6 +4332,7 @@ def _build_adaptive_pipeline(
         data["latent_rejected"] = _make_tensors(n, seed=4)
         data["original_resolution_rejected"] = sources["rejected_resolutions"]
         data["image_path_rejected"] = sources["rejected_paths"]
+    data.update(extra_data or {})
     upstream = _CountingDataModule(data=data, length=n)
     additional = ["original_resolution_rejected"] if dpo else []
     bucketing = AspectBucketing(
@@ -4350,7 +4356,7 @@ def _build_adaptive_pipeline(
 
     split_names = ["latent", "latent_rejected"] if dpo else ["latent"]
     cache_mod = SmartDiskCache(
-        cache_dir=str(tmp_path / "cache"),
+        cache_dir=str(tmp_path / cache_subdir),
         split_names=split_names,
         aggregate_names=["crop_resolution"],
         modeltype="testmodel",
@@ -4364,6 +4370,7 @@ def _build_adaptive_pipeline(
         adaptive_resolution_ladder=ladder,
         additional_resolution_in_names=additional or None,
         adaptive_resolution_max=int(target),
+        **cache_kwargs,
     )
     output_mod = OutputPipelineModule(names=split_names + ["crop_resolution"])
     ds = MGDS(
@@ -4627,3 +4634,108 @@ class TestIndexSaveDiscipline:
         assert "latent" in torch.load(sentinel, weights_only=False)
         assert saves.count == 0
         assert _index_stat(cache2.cache_dir) == stat_before
+
+
+# ---------------------------------------------------------------------------
+# Header-only resolution for new items
+# ---------------------------------------------------------------------------
+
+HEADER_PATHS = {"original_resolution": "image_path", "original_resolution_rejected": "image_path_rejected"}
+
+
+def _image_dataset(tmp_path, role: str, header_sizes: dict[int, tuple[int, int]] | None = None) -> dict:
+    """_adaptive_dataset with real PNG sources sized to the stamped
+    resolutions, so the header read sees what the walk reports.
+    ``header_sizes`` overrides a chosen image's file size (index -> (h, w))."""
+    sources = _adaptive_dataset(tmp_path, role)
+
+    def write(paths, resolutions, overrides):
+        written = []
+        for i, (path, (h, w)) in enumerate(zip(paths, resolutions, strict=True)):
+            h, w = overrides.get(i, (h, w))
+            png = os.path.splitext(path)[0] + ".png"
+            Image.new("RGB", (w, h), color=(40 * i, 0, 0)).save(png)
+            written.append(png)
+        return written
+
+    sources["paths"] = write(sources["paths"], sources["resolutions"], header_sizes or {})
+    if role == "dpo":
+        sources["rejected_paths"] = write(sources["rejected_paths"], sources["rejected_resolutions"], {})
+    return sources
+
+
+def _variant_keys(cache_mod) -> dict[str, list[str]]:
+    return {os.path.basename(fp): sorted(e["variants"]) for fp, e in cache_mod.cache_index["entries"].items()}
+
+
+class TestHeaderResolution:
+    @pytest.mark.parametrize("role", ["sft", "dpo"])
+    def test_header_keys_match_decoded_walk_without_walking(self, tmp_path, role):
+        sources = _image_dataset(tmp_path, role)
+        walk_ds, walk_cache, _ = _build_adaptive_pipeline(tmp_path, sources, role=role, cache_subdir="walk")
+        header_ds, header_cache, _ = _build_adaptive_pipeline(
+            tmp_path, sources, role=role, cache_subdir="header", header_resolution_path_in_names=HEADER_PATHS
+        )
+        walk_walks = _CallCounter(walk_cache, "_get_resolution_string")
+        header_walks = _CallCounter(header_cache, "_get_resolution_string")
+
+        _drain(walk_ds)
+        _drain(header_ds)
+
+        assert walk_walks.count > 0
+        assert header_walks.count == 0
+        assert _variant_keys(header_cache) == _variant_keys(walk_cache)
+
+    def test_blocked_flag_falls_back_to_walk(self, tmp_path):
+        sources = _image_dataset(tmp_path, "dpo")
+        ds, cache_mod, _ = _build_adaptive_pipeline(
+            tmp_path,
+            sources,
+            role="dpo",
+            extra_data={"rotate_crop": [True]},
+            header_resolution_path_in_names=HEADER_PATHS,
+            header_resolution_blocked_in_names=["rotate_crop"],
+        )
+        walks = _CallCounter(cache_mod, "_get_resolution_string")
+
+        _drain(ds)
+
+        assert walks.count == len(sources["paths"])
+
+    def test_missing_rejected_mapping_falls_back_to_walk(self, tmp_path):
+        """A DPO cache needs the rejected size too; without its path mapping
+        the header path can't resolve the tier and must not guess."""
+        sources = _image_dataset(tmp_path, "dpo")
+        ds, cache_mod, _ = _build_adaptive_pipeline(
+            tmp_path,
+            sources,
+            role="dpo",
+            header_resolution_path_in_names={"original_resolution": "image_path"},
+        )
+        walks = _CallCounter(cache_mod, "_get_resolution_string")
+
+        _drain(ds)
+
+        assert walks.count == len(sources["paths"])
+
+    def test_header_mismatch_warns_and_next_validation_rebuilds(self, tmp_path, capsys):
+        """A header that disagrees with the decoded size (here a portrait file
+        whose pipeline reports landscape) keys the first build wrong; the build
+        stamps the decoded size, so the next start re-keys it to the walk's."""
+        sources = _image_dataset(tmp_path, "sft", header_sizes={1: (520, 700)})
+        reference_ds, reference_cache, _ = _build_adaptive_pipeline(tmp_path, sources, cache_subdir="walk")
+        _drain(reference_ds)
+
+        ds, cache_mod, _ = _build_adaptive_pipeline(tmp_path, sources, header_resolution_path_in_names=HEADER_PATHS)
+        capsys.readouterr()
+        _drain(ds)
+        out = capsys.readouterr().out
+
+        assert "1 image header size(s) disagreed with the decoded size" in out
+        assert "header 520x700 vs decoded 700x520" in out
+
+        ds2, cache2, _ = _build_adaptive_pipeline(tmp_path, sources, header_resolution_path_in_names=HEADER_PATHS)
+        _drain(ds2)
+        expected = _variant_keys(reference_cache)
+        for name, keys in _variant_keys(cache2).items():
+            assert set(expected[name]) <= set(keys)

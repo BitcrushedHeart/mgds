@@ -1,5 +1,6 @@
 import threading
 import time
+from collections.abc import Callable, Hashable
 from typing import Any
 
 import torch
@@ -8,16 +9,19 @@ import torch
 class PendingEncode:
     """One in-flight encode request handed to the batch collector.
 
-    ``result`` is opaque to the collector — a single hidden-state tensor for
-    most encoders, a list of per-layer tensors for encoders that output all
-    hidden states (e.g. EncodeLlamaText for HiDream).
+    ``tokens`` is the encoder input: token ids for the text encoders, the
+    image tensor for EncodeVAE. ``result`` is opaque to the collector — a
+    single hidden-state tensor for most encoders, a list of per-layer tensors
+    for encoders that output all hidden states (e.g. EncodeLlamaText for
+    HiDream), a latent distribution for EncodeVAE.
     """
 
-    __slots__ = ("tokens", "mask", "result", "error", "done")
+    __slots__ = ("tokens", "mask", "group", "result", "error", "done")
 
     def __init__(self, tokens: torch.Tensor, mask: torch.Tensor | None):
         self.tokens = tokens
         self.mask = mask
+        self.group: Hashable = None
         self.result: Any = None
         self.error: BaseException | None = None
         self.done = False
@@ -38,18 +42,45 @@ class BatchCollector:
     dominated by weight streaming/dequant, so batching N captions per forward
     is close to an N-fold throughput win. With a resident encoder it still
     amortizes kernel launch and Python overhead.
+
+    ``group_key_fun`` restricts a batch to requests with the same key (inputs
+    that can't be padded together, like images of different sizes). Each
+    batch serves the oldest pending request's group, so no group starves.
+    ``batch_limit_fun`` caps a group's batch below ``max_batch_size`` (e.g. a
+    pixel budget, so large images batch fewer at a time).
     """
 
-    def __init__(self, run_batch_fun, max_batch_size: int, max_wait_seconds: float = 0.02):
+    def __init__(
+        self,
+        run_batch_fun,
+        max_batch_size: int,
+        max_wait_seconds: float = 0.02,
+        group_key_fun: Callable[[PendingEncode], Hashable] | None = None,
+        batch_limit_fun: Callable[[PendingEncode], int] | None = None,
+    ):
         self._run_batch_fun = run_batch_fun
         self._max_batch_size = max(1, int(max_batch_size))
         self._max_wait_seconds = max_wait_seconds
+        self._group_key_fun = group_key_fun
+        self._batch_limit_fun = batch_limit_fun
         self._cond = threading.Condition()
         self._pending: list[PendingEncode] = []
         self._leader_active = False
 
+    def _batch_limit(self, request: PendingEncode) -> int:
+        if self._batch_limit_fun is None:
+            return self._max_batch_size
+        return max(1, min(self._max_batch_size, int(self._batch_limit_fun(request))))
+
+    def _pending_in_group(self, group: Hashable) -> list[PendingEncode]:
+        if self._group_key_fun is None:
+            return self._pending
+        return [r for r in self._pending if r.group == group]
+
     def encode(self, tokens: torch.Tensor, mask: torch.Tensor | None) -> Any:
         request = PendingEncode(tokens, mask)
+        if self._group_key_fun is not None:
+            request.group = self._group_key_fun(request)
         cond = self._cond
         cond.acquire()
         try:
@@ -64,14 +95,19 @@ class BatchCollector:
                     continue
 
                 self._leader_active = True
+                # Our request is still pending here (no batch is running and
+                # it isn't done), so the queue is never empty.
+                head = self._pending[0]
+                limit = self._batch_limit(head)
                 deadline = time.monotonic() + self._max_wait_seconds
-                while len(self._pending) < self._max_batch_size:
+                while len(self._pending_in_group(head.group)) < limit:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
                     cond.wait(timeout=remaining)
-                batch = list(self._pending[: self._max_batch_size])
-                del self._pending[: len(batch)]
+                batch = self._pending_in_group(head.group)[:limit]
+                taken = {id(r) for r in batch}
+                self._pending = [r for r in self._pending if id(r) not in taken]
                 cond.release()
                 try:
                     self._run_batch(batch)
